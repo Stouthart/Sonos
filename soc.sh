@@ -2,11 +2,11 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# IPv4 address: /dev/tcp also resolves IPv6 (~1 s for .local), and the speaker rejects other Host names
+# IPv4 only: /dev/tcp takes ~1 s for a .local name, and the speaker rejects other names
 HOST=${SONOS_IP-}
-# read -N is 2.5x faster than -d ''; Bash 3.2 lacks it
+# read -N (Bash 4.1+) is 2.5x faster than -d ''
 RD=(-d '')
-((BASH_VERSINFO[0] < 4)) || RD=(-N 1048576)
+((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || RD=(-N 1048576)
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport
@@ -39,7 +39,28 @@ error() {
   exit "$1"
 }
 
-# Print the track's artwork URL; relative ones are served by the player
+# Print the speaker's details as key=value, or one field of its device description - [key]
+about() {
+  local k keys=(modelName modelNumber roomName displayVersion softwareVersion hardwareVersion
+    serialNum MACAddress apiVersion) v
+
+  if [[ -n $1 ]]; then
+    [[ $1 =~ ^[[:alnum:]]{2,32}$ ]] || error 201
+    keys=("$1")
+  fi
+
+  get xml/device_description.xml
+  for k in "${keys[@]}"; do
+    # The root device's fields come before those of its embedded devices
+    [[ $REPLY =~ "<$k>"([^<]*)"</$k>" ]] || continue
+    v=${BASH_REMATCH[1]}
+    v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${v//[[:cntrl:]]/}
+    [[ -n $1 ]] && printf '%s\n' "$v" || printf '%s=%s\n' "$k" "$v"
+  done
+}
+
+# Track artwork URL; the player serves relative ones
 artwork() {
   local url
 
@@ -48,16 +69,64 @@ artwork() {
   [[ -z $url ]] || printf '%s\n' "${url/#\//http://$HOST:1400/}"
 }
 
-# Unescaped DIDL-Lite element of REPLY's track metadata, controls stripped - <var> <element>
+# DIDL-Lite element of REPLY, unescaped, controls stripped - <var> <element>
 didl() {
   local i v=''
 
   [[ $REPLY =~ "&lt;$2&gt;"(([^&]|&[^l])*)"&lt;/$2&gt;" ]] && v=${BASH_REMATCH[1]}
-  # SOAP escapes the DIDL-Lite markup, which escapes its own text
+  # Escaped twice: DIDL-Lite text inside SOAP
   for i in 1 2; do
     v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
   done
   printf -v "$1" %s "${v//[[:cntrl:]]/}"
+}
+
+# Play a file from an SMB share the speaker can read - <//host/share/path>
+file() {
+  local LC_ALL=C c i n uri=${1#//}
+
+  [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
+  # Percent-encode the bytes outside the unreserved set, if there are any
+  if [[ $uri == *[^[:alnum:]/._~+-]* ]]; then
+    uri=''
+    for ((i = 2; i < ${#1}; i++)); do
+      c=${1:i:1}
+      case $c in
+      [[:alnum:]/._~+-]) uri+=$c ;;
+      *)
+        # Bash 3.2 sign-extends bytes above 0x7F
+        printf -v n %d "'$c"
+        printf -v c %%%02X $((n & 255))
+        uri+=$c
+        ;;
+      esac
+    done
+  fi
+
+  soap "$AVT" SetAVTransportURI "<CurrentURI>x-file-cifs://$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+  soap "$AVT" Play '<Speed>1</Speed>'
+}
+
+# GET a page into REPLY, joining the chunks the speaker sends it in - <path>
+get() {
+  local LC_ALL=C b n
+
+  [[ -n $HOST ]] || error 204
+  { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null || error 7
+  printf 'GET /%s HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\n\r\n' "$1" "$HOST" >&3
+  IFS= read -r "${RD[@]}" b <&3 || :
+  exec 3<&-
+
+  [[ $b == 'HTTP/1.1 200 '* ]] || error 202
+  REPLY=${b#*$'\r\n\r\n'}
+  [[ ${b%%$'\r\n\r\n'*} == *[Cc]hunked* ]] || return 0
+
+  # <hex size> CRLF <data> CRLF, up to size 0; sizes count bytes, hence the C locale
+  b=$REPLY REPLY=''
+  while [[ $b =~ ^([[:xdigit:]]{1,8})$'\r\n' ]] && ((n = 16#${BASH_REMATCH[1]})); do
+    b=${b:${#BASH_REMATCH[0]}} REPLY+=${b:0:n} b=${b:n+2}
+  done
+  [[ $b == 0$'\r\n'* ]] || error 202
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
@@ -80,8 +149,9 @@ led() {
   fi
 }
 
+# Print "artist / title [album]", then position, duration, quality and source
 now() {
-  local alb art bits=0 dur loss='' lq=(lossy lossless) pos q='' rate=0 src tit
+  local alb art bits=0 dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tit
 
   soap "$AVT" GetPositionInfo
   secs pos RelTime
@@ -95,13 +165,15 @@ now() {
   didl q r:streamInfo
   [[ $q =~ (^|,)bd:([0-9]{1,2})(,|$) ]] && bits=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)sr:([0-9]{4,6})(,|$) ]] && rate=$((10#${BASH_REMATCH[2]}))
-  # Lossless flag
   [[ $q =~ (^|,)l:([01])(,|$) ]] && loss=${BASH_REMATCH[2]}
+  # Files report no stream info, only the format in their MIME type
+  [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]}
 
-  # Source from the URI scheme; Virtual Line-In names its service after the comma
+  # Source: the URI scheme, or for Virtual Line-In the service after the comma
   tag TrackURI
   src=${BASH_REMATCH[1]%%:*}
   case $src in
+  x-file-cifs) src='file' ;;
   x-sonos-htastream) src=tv ;;
   x-sonos-vli) src=${BASH_REMATCH[1]#*,} src=${src%%:*} ;;
   *) src=${src#x-} src=${src#sonos-} src=${src#sonosapi-} src=${src#rincon-} ;;
@@ -109,15 +181,17 @@ now() {
   src=${src//[^[:alnum:]._-]/}
 
   tit=$art${art:+${tit:+ / }}$tit${alb:+ [$alb]}
-  # kHz as %g prints it, without the locale switch %g needs
+
+  # kHz as %g would print it, without its locale switch
   if ((rate)); then
     q=$((rate % 1000 + 1000)) q=${q#1} q=${q%0} q=${q%0} q=${q%0}
     rate=" $((rate / 1000))${q:+.$q}kHz"
   else
     rate=''
   fi
+
   ((bits)) && bits=" ${bits}bit" || bits=''
-  q=${loss:+ ${lq[loss]}}$rate$bits
+  q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
   printf '%s\n%d:%02d / %d:%02d%s [%s]\n' "${tit:-UNKNOWN}" $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) \
     "${q:+ -$q}" "${src:-UNKNOWN}"
 }
@@ -127,6 +201,7 @@ playmode() {
   local i modes=(NORMAL REPEAT_ONE REPEAT_ALL SHUFFLE_NOREPEAT SHUFFLE_REPEAT_ONE SHUFFLE) r s
 
   [[ -z $2 || $2 =~ ^[0-2]$ && $2 -le $((2 - $1)) ]] || error 201
+
   soap "$AVT" GetTransportSettings
   tag PlayMode '[A-Z_]{1,20}'
   case ${BASH_REMATCH[1]} in
@@ -158,7 +233,7 @@ playpause() {
   esac
 }
 
-# Read the reply on fd 3 or 4; sets REPLY, exits on fault or foreign reply - <fd> <action>
+# Read fd 3 or 4 to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
 recv() {
   IFS= read -r "${RD[@]}" REPLY <&"$1" || :
   case $1 in
@@ -166,7 +241,7 @@ recv() {
   *) exec 4<&- ;;
   esac
 
-  [[ $REPLY == *"$2"Response* ]] && return
+  [[ $REPLY == 'HTTP/1.1 200 '* && $REPLY == *[\<:]"$2"Response[[:space:]/\>]* ]] && return
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$2" "${BASH_REMATCH[1]}"
   error 202
 }
@@ -197,28 +272,28 @@ seek() {
     error 201
   fi
 
-  # Relative in one request: the speaker stops at the start and skips to the next track past the end
+  # Relative: one request; the speaker stops at 0:00, and past the end skips to the next track
   [[ -z $sign ]] || unit=TIME_DELTA
   printf -v val '%s%d:%02d:%02d' "$sign" $((val / 3600)) $((val / 60 % 60)) $((val % 60))
   soap "$AVT" Seek "<Unit>$unit</Unit><Target>$val</Target>"
 }
 
 # Connect fd 3 or 4 and send a UPnP action - <fd> <service path> <action> [arguments]
-# The speaker ends each reply by closing; an unreachable one blocks the connect until the OS gives up (~75 s)
+# No connect timeout: an unreachable speaker blocks until the OS gives up (~75 s)
 send() {
   local body urn=urn:schemas-upnp-org:service:${2##*/}:1
 
-  # Here rather than up front, so option and argument errors come first
+  # Here, so option and argument errors come first
   [[ -n $HOST ]] || error 204
   body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
 <s:Body><u:$3 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${4-}</u:$3></s:Body></s:Envelope>"
-  # case: a literal fd is 3 µs cheaper than eval
+  # Literal fds: 3 µs cheaper than eval
   case $1 in
   3) { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
   *) { exec 4<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
   esac || error 7
   # Bodies are ASCII, so characters equal bytes
-  printf 'POST /%s/Control HTTP/1.1\r\nHost: %s:1400\r\nContent-Type: text/xml; charset="utf-8"\r\nSOAPACTION: "%s#%s"\r\nContent-Length: %d\r\n\r\n%s' \
+  printf 'POST /%s/Control HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\nContent-Type: text/xml; charset="utf-8"\r\nSOAPACTION: "%s#%s"\r\nContent-Length: %d\r\n\r\n%s' \
     "$2" "$HOST" "$urn" "$3" "${#body}" "$body" >&"$1"
 }
 
@@ -228,19 +303,24 @@ soap() {
   recv 3 "$2"
 }
 
-# Get or set speech enhancement (0 off, 1..4 level); both values travel at once over two connections - [arg]
+# Get or set speech enhancement (0 off, 1..4 level), both values at once - [arg]
 speech() {
-  local dl='<EQType>DialogLevel</EQType>' on se='<EQType>SpeechEnhanceEnabled</EQType>'
+  local dl='<EQType>DialogLevel</EQType>' se='<EQType>SpeechEnhanceEnabled</EQType>'
 
   if [[ -z $1 ]]; then
     send 3 "$RC" GetEQ "$se"
     send 4 "$RC" GetEQ "$dl"
     recv 3 GetEQ
     tag CurrentValue '[01]'
-    on=${BASH_REMATCH[1]}
-    recv 4 GetEQ
-    tag CurrentValue '[0-4]'
-    ((on)) && printf '%s\n' "${BASH_REMATCH[1]}" || printf '0\n'
+    if ((BASH_REMATCH[1])); then
+      recv 4 GetEQ
+      tag CurrentValue '[0-4]'
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+      # Off: the level doesn't matter, so don't wait for it
+      exec 4<&-
+      printf '0\n'
+    fi
   elif [[ $1 =~ ^[0-4]$ ]]; then
     # Level 0 is accepted but ignored; off is a separate switch
     send 3 "$RC" SetEQ "$se<DesiredValue>$(($1 > 0))</DesiredValue>"
@@ -273,7 +353,7 @@ timer() {
   fi
 }
 
-# Switch to the HDMI input; the stream URI needs the player's id, found by its address in the topology
+# Switch to the TV input; the stream URI needs this player's id, found by HOST in the topology
 tv() {
   soap ZoneGroupTopology GetZoneGroupState
   [[ $REPLY =~ 'UUID=&quot;'(RINCON_[[:alnum:]]{1,32})'&quot; Location=&quot;http://'"$HOST"':1400/' ]] || error 202
@@ -284,16 +364,13 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 1.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 1.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
 
-Power:
-  sleep 0..120
-
 Playback:
-  artwork | next | now | pause | play | prev | stop
+  artwork | file //host/share/path | next | now | pause | play | prev | stop
   repeat 0..2 | seek 0..3599 | shuffle 0..1
 
 Audio:
@@ -301,11 +378,12 @@ Audio:
   night 0..1 | speech 0..4 | treble -10..10 | vol 0..100
 
 Other:
-  led 0..1 | tv
+  about | led 0..1 | sleep 0..120 | tv
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
+About accepts a key (e.g. about modelName).
 Requires SONOS_IP: the speaker's IPv4 address."
 }
 
@@ -325,7 +403,7 @@ value() {
 # Get, set or adjust (±) volume - [arg]
 volume() {
   if isnum "$1" 100 && [[ -n ${BASH_REMATCH[1]} ]]; then
-    # Speaker clamps the result to 0..100
+    # The speaker clamps to 0..100
     soap "$RC" SetRelativeVolume "$CH<Adjustment>${BASH_REMATCH[0]#+}</Adjustment>"
   else
     value "$RC" Volume Volume "$CH" 0 100 "$1"
@@ -344,11 +422,11 @@ case $opt in
 esac
 
 case $opt in
-sleep)
-  timer "$arg"
-  ;;
 artwork)
   artwork
+  ;;
+file)
+  file "$arg"
   ;;
 next)
   soap "$AVT" Next
@@ -401,8 +479,14 @@ treble)
 vol | volume)
   volume "$arg"
   ;;
+about)
+  about "$arg"
+  ;;
 led)
   led "$arg"
+  ;;
+sleep)
+  timer "$arg"
   ;;
 tv)
   tv

@@ -1,4 +1,4 @@
-<!-- 1.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 1.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -6,14 +6,14 @@ A small Bash script that controls a **Sonos** speaker from the command line, ove
 
 Two interchangeable versions are included:
 
-| Script        | Uses              | Best for                                                                |
-| ------------- | ----------------- | ----------------------------------------------------------------------- |
-| `soc.sh`      | Bash's `/dev/tcp` | Speed: no program is started per request, about 5 ms faster than `curl` |
-| `soc-curl.sh` | `curl`            | A 2-second timeout when the speaker is unreachable, and `.local` names  |
+| Script        | Uses              | Best for                                                                                              |
+| ------------- | ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `soc.sh`      | Bash's `/dev/tcp` | Speed: no program is started per request, about 2 ms faster than `curl` on a Mac and 20 ms on Android |
+| `soc-curl.sh` | `curl`            | A 2-second timeout when the speaker is unreachable, and `.local` names                                |
 
 Both take the same options and print the same output.
 
-This is **version 1.0**, the first release. The [release notes](RELEASE.md) list what it covers.
+This is **version 1.1**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -59,20 +59,13 @@ Options print the current value when called without an argument. Only `vol` and 
 
 Options that only act (`play`, `vol 40`) print nothing; the exit code tells you whether they worked. An option that takes no argument rejects one, so `stop now` fails rather than stopping. Arguments are checked before anything is sent.
 
-### Power
-
-| Option           | Description                                               |
-| ---------------- | --------------------------------------------------------- |
-| `sleep [0..120]` | Show the sleep timer, set it in minutes, or cancel it (0) |
-
-`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
-
 ### Playback
 
 | Option           | Description                                  |
 | ---------------- | -------------------------------------------- |
 | `now`            | Show formatted now playing info              |
 | `artwork`        | Show the artwork URL for the current track   |
+| `file <path>`    | Play a file from an SMB share                |
 | `play` / `stop`  | Transport control                            |
 | `pause`          | Pause while playing, otherwise play          |
 | `next` / `prev`  | Skip track (alias: `previous`)               |
@@ -80,9 +73,11 @@ Options that only act (`play`, `vol 40`) print nothing; the exit code tells you 
 | `shuffle [0..1]` | Get or set shuffle                           |
 | `repeat [0..2]`  | Get or set repeat: 0 off, 1 one track, 2 all |
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
 
 `artwork` prints the URL of the current track's artwork, either the streaming service's own link or an image the speaker serves itself, so `open -u "$(soc.sh artwork)"` shows it on macOS. With no artwork it prints nothing and succeeds.
+
+`file` plays one file from an SMB share, given as `//host/share/path` including the file's extension, e.g. `soc.sh file //192.168.1.10/podcasts/episode.mp3`. It replaces what is playing, and `now` shows the source as `file`. The speaker needs read access to the share; a share in its music library works with the login stored there. Characters other than letters, digits and `/._~+-` are percent-encoded, so names with spaces work as they are.
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds or a `min:sec` position (`seek 219` and `seek 3:39` are the same jump), either with an optional `+` or `-`. Both forms top out at `3599` and `59:59`, and the seconds in `min:sec` are always two digits. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
 
@@ -109,10 +104,16 @@ A relative `vol` is applied by the speaker, which keeps the result within 0..100
 
 ### Other
 
-| Option       | Description                 |
-| ------------ | --------------------------- |
-| `led [0..1]` | Get or set the status light |
-| `tv`         | Switch to the TV input      |
+| Option           | Description                                               |
+| ---------------- | --------------------------------------------------------- |
+| `about [key]`    | Show model, room, software, hardware, serial and MAC      |
+| `led [0..1]`     | Get or set the status light                               |
+| `sleep [0..120]` | Show the sleep timer, set it in minutes, or cancel it (0) |
+| `tv`             | Switch to the TV input                                    |
+
+`about` prints the speaker's details as `key=value`, under the speaker's own field names: `modelName`, `modelNumber`, `roomName`, `displayVersion` (the Sonos software version the app shows), `softwareVersion` (its build), `hardwareVersion`, `serialNum`, `MACAddress` and `apiVersion`. `about <key>` prints one value, and takes any field of the speaker's device description, such as `about memory`; a field the speaker doesn't have prints nothing.
+
+`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
 
 `tv` first looks up the speaker's own player ID, which the TV input's address contains.
 
@@ -133,6 +134,7 @@ soc.sh now
 soc.sh artwork               # https://i.scdn.co/image/ab67616d...
 soc.sh pause                 # pause, or resume when paused
 soc.sh next                  # next track
+soc.sh file //192.168.1.10/podcasts/episode.mp3   # play a file from a share
 
 soc.sh seek                  # -> 104
 soc.sh seek 3:39             # jump to 3:39
@@ -148,6 +150,9 @@ soc.sh height -2             # a little less height
 soc.sh sleep 45              # sleep timer: 45 minutes
 soc.sh sleep                 # -> 00:44:59
 soc.sh sleep 0               # cancel it
+
+soc.sh about                 # modelName=Sonos Beam Ultra, roomName=..., ...
+soc.sh about displayVersion  # -> 27.1
 ```
 
 Useful shell aliases:

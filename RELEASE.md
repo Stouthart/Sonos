@@ -1,8 +1,23 @@
-<!-- 1.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 1.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first. 1.0 is the version distributed.
+Highlights per version, newest first. 1.1 is the version distributed.
+
+## 1.1 - October 2026
+
+Product details, files from a network share, and stricter checks on replies.
+
+- **New `about`**, printing the speaker's details from its device description: model, room, Sonos software version and build, hardware version, serial number, MAC address and API version. `about <key>` prints one field, such as `about displayVersion`, and takes any field the speaker describes; one it doesn't have prints nothing. The speaker sends that description in chunks, which `soc.sh` joins in builtin code.
+- **New `file`**, playing one file from an SMB share given as `//host/share/path`, e.g. `soc.sh file //192.168.1.10/podcasts/episode.mp3`. The speaker fills in title, artist and album from the file's tags, and `now` shows the source as `file`. Files report no sample rate or bit depth, so `now` shows the format from the file's MIME type instead, such as `mpeg`.
+- **`sleep` moved to Other** in the usage screen, next to `about`, `led` and `tv`. The Power section, which held only `sleep`, is gone.
+- **Stricter checks on replies.**
+  - A reply must be the action's own response element, and in `soc.sh` also HTTP 200. An HTML page or a UPnP fault that only mentions it no longer counts as success.
+  - `soc.sh` asks the speaker to close each connection, so a server that would keep it open can't stall a command.
+  - A chunked page that is cut short reports `Invalid response from Sonos.` instead of passing.
+- **`speech` in `soc-curl.sh` sends its two requests at the same time**, as `soc.sh` does, rather than one after the other in a single `curl` run: about 7 ms faster.
+- `speech` prints `0` as soon as Speech Enhancement turns out to be off, without waiting for the level. `soc.sh` uses `read -N` from Bash 4.1, where it was introduced, rather than 4.0.
+- Comments condensed, and the obvious ones removed (code improvement).
 
 ## 1.0 - October 2026
 
