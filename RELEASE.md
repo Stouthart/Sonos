@@ -1,8 +1,26 @@
-<!-- 1.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 2.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first. 1.1 is the version distributed.
+Highlights per version, newest first. 2.0 is the version distributed.
+
+## 2.0 - October 2026
+
+Favorites, the queue, lip sync, and sturdier replies. The usage screen has two new sections, Sources and Queue, and `file` and `tv` moved into Sources, hence the new major version.
+
+- **New `favorites`**, listing the app's **Sonos Favorites** by number, and playing one with `favorites <n>` (aliases: `favourites`, `favs`). A station or track plays at once; a playlist or album is added to the end of the queue and played from its first track. A favorite that is only a shortcut into the app, such as Sonos Radio's own, reports that instead (exit `205`).
+- **New `queue` and `clear`**, in a new Queue section of the usage screen. `queue` lists the queue like the first line of `now`, with the current track marked `>`, and `queue <n>` plays from track _n_, switching to the queue when another source is playing (alias: `playqueue`). `clear` empties it. In `soc.sh` the list and the position are read at the same time; `soc-curl.sh` reads them one after the other, as two `curl` runs at once made the long reply stall for about 100 ms in one run of four.
+- **New `lipsync`**, the app's **TV dialog sync**, also listed as **Audio delay (lip sync)**: it delays the TV's sound in steps from 0 to 5, to match a picture that lags behind it. The speaker refuses anything outside 0..5, which `lipsync` checks before sending. In the Audio section, next to `night`, `speech` and `height`.
+- **New Sources section** in the usage screen, after Playback, for the options that pick what plays: `favorites`, `file` and `tv`. `file` moved there from Playback, `tv` from Other.
+- **Sturdier replies.**
+  - `soc.sh` joins the chunks that Browse replies come in, which every 4 KB could break a title or address in a list or a favorite. It walks the chunks by offset, so joining doesn't copy the rest of a long reply for every chunk.
+  - `soc.sh` fails rather than accept a reply cut short at its read limit, now 16 MiB.
+  - `soc-curl.sh` only accepts a reply when `curl` succeeded too, so an HTTP error or a cut-off transfer no longer passes.
+- **`favorites` and `queue` read on** while the speaker caps a reply, until they have every entry, and stop if a reply brings nothing new.
+- **Fast lists on Bash 3.2.** Its pattern replacement slows down sharply with size, so before Bash 4.1 a list is cut up entry by entry, and read in pages of 100. A 29-track queue takes 50 ms rather than a second, and a 1,000-track one 0.6 s rather than minutes.
+- **`speech` in `soc-curl.sh` sends its two requests one after the other again.** Run alongside, a failed second request could pass unnoticed, as its `curl` exit status was lost, and two `curl` runs at once stalled for up to 200 ms in some runs. A reading now takes about 38 ms rather than 27 ms when nothing stalls.
+- `soc.sh` joins any reply the speaker sends in chunks, not just Browse replies, in case a software update chunks others too.
+- `now`'s first line and the queue entries share one formatter, and `tv` and `queue` one player ID lookup (code improvement).
 
 ## 1.1 - October 2026
 

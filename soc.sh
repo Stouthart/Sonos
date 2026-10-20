@@ -4,21 +4,17 @@ IFS=$'\n\t'
 
 # IPv4 only: /dev/tcp takes ~1 s for a .local name, and the speaker rejects other names
 HOST=${SONOS_IP-}
-# read -N (Bash 4.1+) is 2.5x faster than -d ''
-RD=(-d '')
-((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || RD=(-N 1048576)
+# read -N (Bash 4.1+) is 2.5x faster than -d ''; older Bash splits long lists slowly, so it reads them in pages
+RD=(-d '') PG=100
+((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || RD=(-N 16777216) PG=0
 
 # Service paths; Master channel argument
-AVT=MediaRenderer/AVTransport
-CH='<Channel>Master</Channel>'
-DP=DeviceProperties
-RC=MediaRenderer/RenderingControl
+AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
 
 [[ ${1-} == --xdbg ]] && {
   shift
   PS4='+\e[5G\e[36m$(((${EPOCHREALTIME/./}-_ERT+500)/1000))\e[9G\e[33m$LINENO\e[13G\e[90m>\e[15G\e[m'
-  : "${EPOCHREALTIME=0}" # Bash <5: avoid set -u failure; timing stays 0
-  readonly _ERT=${EPOCHREALTIME/./}
+  _ERT=${EPOCHREALTIME=0} _ERT=${_ERT/./} # Bash <5: nounset-safe, zero timing.
   set -x
 }
 
@@ -33,6 +29,7 @@ error() {
   202) msg='Invalid response from Sonos.' ;;
   203) [[ $3 == 701 ]] && msg="$2 not available for the current source." || msg="Sonos refused $2, UPnP error $3." ;;
   204) msg="Set SONOS_IP to the speaker's IPv4 address." ;;
+  205) msg="Favorite $2 is a shortcut; play it from the Sonos app." ;;
   esac
 
   printf '%s\n' "$msg" >&2
@@ -53,8 +50,7 @@ about() {
   for k in "${keys[@]}"; do
     # The root device's fields come before those of its embedded devices
     [[ $REPLY =~ "<$k>"([^<]*)"</$k>" ]] || continue
-    v=${BASH_REMATCH[1]}
-    v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${BASH_REMATCH[1]//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
     v=${v//[[:cntrl:]]/}
     [[ -n $1 ]] && printf '%s\n' "$v" || printf '%s=%s\n' "$k" "$v"
   done
@@ -69,16 +65,88 @@ artwork() {
   [[ -z $url ]] || printf '%s\n' "${url/#\//http://$HOST:1400/}"
 }
 
+# Request a container's children on fd 3 or 4 - <fd> <object id> [start] [count, 0 for all; default PG]
+browse() {
+  send "$1" MediaServer/ContentDirectory Browse \
+    "<ObjectID>$2</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>${3-0}</StartingIndex><RequestedCount>${4-$PG}</RequestedCount><SortCriteria></SortCriteria>"
+}
+
+# Set REPLY to its body, joined if chunked: <hex size> CRLF <data> CRLF, up to size 0; sizes count bytes
+dechunk() {
+  local LC_ALL=C b i=0 n
+
+  b=${REPLY#*$'\r\n\r\n'}
+  if [[ ${REPLY:0:${#REPLY}-${#b}} != *[Cc]hunked* ]]; then
+    REPLY=$b
+    return
+  fi
+  # By offset: cutting each chunk off the front copies the rest every time
+  REPLY=''
+  while [[ ${b:i:10} =~ ^([[:xdigit:]]{1,8})$'\r\n' ]] && ((n = 16#${BASH_REMATCH[1]})); do
+    REPLY+=${b:i+${#BASH_REMATCH[0]}:n}
+    ((i += ${#BASH_REMATCH[0]} + n + 2))
+  done
+  [[ ${b:i:3} == 0$'\r\n' ]] || error 202
+}
+
+# Print prefix, then "artist / title [album]" of REPLY's DIDL-Lite (radio: stream content as title) - <prefix>
+desc() {
+  local alb art q tit
+
+  didl alb upnp:album
+  didl art dc:creator
+  didl tit dc:title
+  didl q r:streamContent
+  [[ -z $q ]] || tit=$q
+  tit=$art${art:+${tit:+ / }}$tit${alb:+ [$alb]}
+  printf '%s%s\n' "$1" "${tit:-UNKNOWN}"
+}
+
 # DIDL-Lite element of REPLY, unescaped, controls stripped - <var> <element>
 didl() {
-  local i v=''
+  local v=''
 
   [[ $REPLY =~ "&lt;$2&gt;"(([^&]|&[^l])*)"&lt;/$2&gt;" ]] && v=${BASH_REMATCH[1]}
-  # Escaped twice: DIDL-Lite text inside SOAP
-  for i in 1 2; do
-    v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
-  done
+  # Escaped twice: DIDL-Lite text inside SOAP; the match stops at &l, so the outer level holds no &lt;
+  v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
   printf -v "$1" %s "${v//[[:cntrl:]]/}"
+}
+
+# List favorites, or play favorite n; containers go through the queue - [n]
+favorites() {
+  # C: byte lengths for Content-Length
+  local LC_ALL=C md='' uri
+
+  if [[ -z $1 ]]; then
+    browse 3 FV:2
+    list FV:2
+    return
+  fi
+
+  [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] || error 201
+  browse 3 FV:2 $(($1 - 1)) 1
+  recv 3 Browse
+  [[ $REPLY == *'<NumberReturned>1</NumberReturned>'* ]] || error 201
+  res uri
+  [[ -n $uri ]] || error 205 "$1"
+
+  [[ $REPLY =~ '&lt;r:resMD&gt;'(([^&]|&[^l])*)'&lt;/r:resMD&gt;' ]] && md=${BASH_REMATCH[1]}
+  # The match stops at &l, so it holds no &lt;
+  md=${md//&gt;/>} md=${md//&quot;/\"} md=${md//&apos;/\'} md=${md//&amp;/\&}
+
+  case $uri in
+  x-rincon-cpcontainer:* | x-rincon-playlist:* | file:*)
+    soap "$AVT" AddURIToQueue \
+      "<EnqueuedURI>$uri</EnqueuedURI><EnqueuedURIMetaData>$md</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>"
+    tag FirstTrackNumberEnqueued '[0-9]{1,5}'
+    playqueue "${BASH_REMATCH[1]}"
+    ;;
+  *)
+    soap "$AVT" SetAVTransportURI "<CurrentURI>$uri</CurrentURI><CurrentURIMetaData>$md</CurrentURIMetaData>"
+    soap "$AVT" Play '<Speed>1</Speed>'
+    ;;
+  esac
 }
 
 # Play a file from an SMB share the speaker can read - <//host/share/path>
@@ -109,24 +177,17 @@ file() {
 
 # GET a page into REPLY, joining the chunks the speaker sends it in - <path>
 get() {
-  local LC_ALL=C b n
+  local rc=0
 
   [[ -n $HOST ]] || error 204
   { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null || error 7
   printf 'GET /%s HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\n\r\n' "$1" "$HOST" >&3
-  IFS= read -r "${RD[@]}" b <&3 || :
+  IFS= read -r "${RD[@]}" REPLY <&3 || rc=$?
   exec 3<&-
 
-  [[ $b == 'HTTP/1.1 200 '* ]] || error 202
-  REPLY=${b#*$'\r\n\r\n'}
-  [[ ${b%%$'\r\n\r\n'*} == *[Cc]hunked* ]] || return 0
-
-  # <hex size> CRLF <data> CRLF, up to size 0; sizes count bytes, hence the C locale
-  b=$REPLY REPLY=''
-  while [[ $b =~ ^([[:xdigit:]]{1,8})$'\r\n' ]] && ((n = 16#${BASH_REMATCH[1]})); do
-    b=${b:${#BASH_REMATCH[0]}} REPLY+=${b:0:n} b=${b:n+2}
-  done
-  [[ $b == 0$'\r\n'* ]] || error 202
+  # read only succeeds at its cap (-N) or a NUL byte (-d ''), either of which cuts the page short
+  ((rc)) && [[ $REPLY == 'HTTP/1.1 200 '* ]] || error 202
+  dechunk
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
@@ -149,19 +210,52 @@ led() {
   fi
 }
 
+# Print a container's items as "n) artist / title [album]", with "> " for item cur if its res is uri;
+# the speaker caps each reply, so read on until TotalMatches; page 1 is already sent on fd 3 - <object id> [cur] [uri]
+list() {
+  # C: faster splitting; in a variable, as Bash 3.2 takes a quoted / in a pattern for the separator
+  local LC_ALL=C e='&lt;/item&gt;' i=0 it items j n t
+
+  while :; do
+    recv 3 Browse
+    tag TotalMatches '[0-9]{1,6}'
+    n=${BASH_REMATCH[1]} j=$i
+    if ((PG)); then
+      # Bash 3.2: ${x//…} slows down quadratically or worse, so cut item by item
+      items=() t=$REPLY
+      while [[ $t == *"$e"* ]]; do
+        it=${t%%"$e"*}
+        items+=("$it")
+        t=${t:${#it}+${#e}}
+      done
+      items+=("$t")
+    else
+      IFS=$'\x1e' read -r -d '' -a items <<<"${REPLY//"$e"/$'\x1e'}" || :
+    fi
+
+    for it in "${items[@]}"; do
+      [[ $it == *'&lt;item '* ]] || continue
+      REPLY=$it
+      # Current: same track number and URI, as the queue may not be the source
+      if ((++i == ${2-0})) && res t && [[ $t == "${3-}" ]]; then
+        desc "$i) > "
+      else
+        desc "$i) "
+      fi
+    done
+    # A page that brings nothing new ends it too
+    ((i < n && i > j)) || return 0
+    browse 3 "$1" "$i"
+  done
+}
+
 # Print "artist / title [album]", then position, duration, quality and source
 now() {
-  local alb art bits=0 dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tit
+  local bits=0 dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src
 
   soap "$AVT" GetPositionInfo
   secs pos RelTime
   secs dur TrackDuration
-  didl alb upnp:album
-  didl art dc:creator
-  didl tit dc:title
-  # Radio: stream content replaces the title
-  didl q r:streamContent
-  [[ -z $q ]] || tit=$q
   didl q r:streamInfo
   [[ $q =~ (^|,)bd:([0-9]{1,2})(,|$) ]] && bits=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)sr:([0-9]{4,6})(,|$) ]] && rate=$((10#${BASH_REMATCH[2]}))
@@ -180,20 +274,18 @@ now() {
   esac
   src=${src//[^[:alnum:]._-]/}
 
-  tit=$art${art:+${tit:+ / }}$tit${alb:+ [$alb]}
-
   # kHz as %g would print it, without its locale switch
   if ((rate)); then
-    q=$((rate % 1000 + 1000)) q=${q#1} q=${q%0} q=${q%0} q=${q%0}
-    rate=" $((rate / 1000))${q:+.$q}kHz"
+    q=$((rate % 1000 + 1000)) q=${q#1} q=${q%0} q=${q%0} q=${q%0} rate=" $((rate / 1000))${q:+.$q}kHz"
   else
     rate=''
   fi
 
   ((bits)) && bits=" ${bits}bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
-  printf '%s\n%d:%02d / %d:%02d%s [%s]\n' "${tit:-UNKNOWN}" $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) \
-    "${q:+ -$q}" "${src:-UNKNOWN}"
+  desc ''
+  printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
+    "${src:-UNKNOWN}"
 }
 
 # Get or set repeat (0 off, 1 one, 2 all) or shuffle - <0 repeat | 1 shuffle> [arg]
@@ -233,17 +325,76 @@ playpause() {
   esac
 }
 
+# Play the queue from track n, switching to it first if needed - <n>
+playqueue() {
+  local id
+
+  soap "$AVT" GetMediaInfo
+  tag CurrentURI
+  if [[ ${BASH_REMATCH[1]} != x-rincon-queue:* ]]; then
+    rincon id
+    soap "$AVT" SetAVTransportURI \
+      "<CurrentURI>x-rincon-queue:$id#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+  fi
+  soap "$AVT" Seek "<Unit>TRACK_NR</Unit><Target>$1</Target>"
+  soap "$AVT" Play '<Speed>1</Speed>'
+}
+
+# List the queue, marking the current track, or play from track n - [n]
+queue() {
+  local cur uri
+
+  if [[ -n $1 ]]; then
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] || error 201
+    playqueue "$1"
+    return
+  fi
+
+  browse 3 Q:0
+  send 4 "$AVT" GetPositionInfo
+  recv 4 GetPositionInfo
+  tag Track '[0-9]{1,5}'
+  cur=${BASH_REMATCH[1]}
+  tag TrackURI
+  uri=${BASH_REMATCH[1]}
+  list Q:0 "$cur" "$uri"
+}
+
 # Read fd 3 or 4 to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
 recv() {
-  IFS= read -r "${RD[@]}" REPLY <&"$1" || :
+  local rc=0
+
+  IFS= read -r "${RD[@]}" REPLY <&"$1" || rc=$?
   case $1 in
   3) exec 3<&- ;;
   *) exec 4<&- ;;
   esac
 
-  [[ $REPLY == 'HTTP/1.1 200 '* && $REPLY == *[\<:]"$2"Response[[:space:]/\>]* ]] && return
+  # As in get; the speaker chunks only Browse replies, but checking the headers costs ~6 µs
+  ((rc)) || error 202
+  if [[ $REPLY == 'HTTP/1.1 200 '* ]]; then
+    [[ ${REPLY:0:256} != *[Cc]hunked* ]] || dechunk
+    [[ $REPLY == *[\<:]"$2"Response[[:space:]/\>]* ]] && return
+  fi
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$2" "${BASH_REMATCH[1]}"
   error 202
+}
+
+# res URI of REPLY's DIDL-Lite item, escaped once as in a SOAP body - <var>
+res() {
+  local v=''
+
+  [[ $REPLY =~ '&lt;res'([^&]|&quot;|&amp;)*'&gt;'(([^&]|&[^l])*)'&lt;/res&gt;' ]] && v=${BASH_REMATCH[2]}
+  # The match stops at &l, so it holds no &lt;
+  v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  printf -v "$1" %s "$v"
+}
+
+# This player's id, found by HOST in the topology - <var>
+rincon() {
+  soap ZoneGroupTopology GetZoneGroupState
+  [[ $REPLY =~ 'UUID=&quot;'(RINCON_[[:alnum:]]{1,32})'&quot; Location=&quot;http://'"$HOST"':1400/' ]] || error 202
+  printf -v "$1" %s "${BASH_REMATCH[1]}"
 }
 
 # H:MM:SS element of REPLY as seconds, 0 if absent - <var> <element>
@@ -285,14 +436,13 @@ send() {
 
   # Here, so option and argument errors come first
   [[ -n $HOST ]] || error 204
-  body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
-<s:Body><u:$3 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${4-}</u:$3></s:Body></s:Envelope>"
-  # Literal fds: 3 µs cheaper than eval
+  body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$3 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${4-}</u:$3></s:Body></s:Envelope>"
+
   case $1 in
   3) { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
   *) { exec 4<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
   esac || error 7
-  # Bodies are ASCII, so characters equal bytes
+  # Content-Length: bodies are ASCII, or the caller runs in the C locale
   printf 'POST /%s/Control HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\nContent-Type: text/xml; charset="utf-8"\r\nSOAPACTION: "%s#%s"\r\nContent-Length: %d\r\n\r\n%s' \
     "$2" "$HOST" "$urn" "$3" "${#body}" "$body" >&"$1"
 }
@@ -353,32 +503,39 @@ timer() {
   fi
 }
 
-# Switch to the TV input; the stream URI needs this player's id, found by HOST in the topology
+# Switch to the TV input; the stream URI needs this player's id
 tv() {
-  soap ZoneGroupTopology GetZoneGroupState
-  [[ $REPLY =~ 'UUID=&quot;'(RINCON_[[:alnum:]]{1,32})'&quot; Location=&quot;http://'"$HOST"':1400/' ]] || error 202
+  local id
+
+  rincon id
   soap "$AVT" SetAVTransportURI \
-    "<CurrentURI>x-sonos-htastream:${BASH_REMATCH[1]}:spdif</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+    "<CurrentURI>x-sonos-htastream:$id:spdif</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
 }
 
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 1.1 - Control Sonos over UPnP
+  printf '%s\n' "$nm 2.0 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
 
 Playback:
-  artwork | file //host/share/path | next | now | pause | play | prev | stop
+  artwork | next | now | pause | play | prev | stop
   repeat 0..2 | seek 0..3599 | shuffle 0..1
 
+Sources:
+  favorites 1..n | file //host/share/path | tv
+
+Queue:
+  clear | queue 1..n
+
 Audio:
-  bass -10..10 | height -10..10 | loudness 0..1 | mute 0..1
+  bass -10..10 | height -10..10 | lipsync 0..5 | loudness 0..1 | mute 0..1
   night 0..1 | speech 0..4 | treble -10..10 | vol 0..100
 
 Other:
-  about | led 0..1 | sleep 0..120 | tv
+  about | led 0..1 | sleep 0..120
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
@@ -411,12 +568,11 @@ volume() {
 }
 
 (($# < 3)) || error 201
-opt=${1-}
-arg=${2-}
+opt=${1-} arg=${2-}
 
 # No-argument options
 case $opt in
-'' | -h | --help | help | artwork | next | now | pause | play | prev | previous | stop | tv)
+'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | stop | tv)
   (($# < 2)) || error 201
   ;;
 esac
@@ -424,9 +580,6 @@ esac
 case $opt in
 artwork)
   artwork
-  ;;
-file)
-  file "$arg"
   ;;
 next)
   soap "$AVT" Next
@@ -455,11 +608,29 @@ shuffle)
 stop)
   soap "$AVT" Stop
   ;;
+favorites | favourites | favs)
+  favorites "$arg"
+  ;;
+file)
+  file "$arg"
+  ;;
+tv)
+  tv
+  ;;
+clear)
+  soap "$AVT" RemoveAllTracksFromQueue
+  ;;
+queue | playqueue)
+  queue "$arg"
+  ;;
 bass)
   value "$RC" Bass Bass '' -10 10 "$arg"
   ;;
 height)
   value "$RC" EQ Value '<EQType>HeightChannelLevel</EQType>' -10 10 "$arg"
+  ;;
+lipsync)
+  value "$RC" EQ Value '<EQType>AudioDelay</EQType>' 0 5 "$arg"
   ;;
 loudness)
   value "$RC" Loudness Loudness "$CH" 0 1 "$arg"
@@ -487,9 +658,6 @@ led)
   ;;
 sleep)
   timer "$arg"
-  ;;
-tv)
-  tv
   ;;
 '' | -h | --help | help)
   usage
