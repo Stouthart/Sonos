@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
+# Plain shebang, unlike soc.sh: runs on any env, BusyBox's included
 set -euo pipefail
 IFS=$'\n\t'
 
 BASE=http://${SONOS_IP-}:1400
-# Bash before 4.1 splits long lists slowly, so it reads them in pages
+# Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
-CURL=(-q -s --noproxy '*' -4 -m2 -HUser-Agent: --fail-with-body '-HContent-Type: text/xml; charset="utf-8"')
+CURL=(-q -g -s --noproxy '*' -4 -m2 -HUser-Agent: --fail-with-body '-HContent-Type: text/xml; charset="utf-8"')
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
+# C1 controls (U+0080..U+009F) in UTF-8, which [[:cntrl:]] only matches in a UTF-8 locale
+C1=$'\xc2[\x80-\x9f]'
 
 [[ ${1-} == --xdbg ]] && {
   shift
   PS4='+\e[5G\e[36m$(((${EPOCHREALTIME/./}-_ERT+500)/1000))\e[9G\e[33m$LINENO\e[13G\e[90m>\e[15G\e[m'
-  _ERT=${EPOCHREALTIME=0} _ERT=${_ERT/./} # Bash <5: nounset-safe, zero timing.
+  _ERT=${EPOCHREALTIME=0} _ERT=${_ERT/./} # Bash <5: nounset-safe, zero timing
   set -x
 }
 
@@ -38,7 +41,7 @@ error() {
   exit "$1"
 }
 
-# Print the speaker's details as key=value, or one field of its device description - [key]
+# Print the speaker's details as key=value, or one device description field - [key]
 about() {
   local k keys=(modelName modelNumber roomName displayVersion softwareVersion hardwareVersion
     serialNum MACAddress apiVersion) v
@@ -50,10 +53,10 @@ about() {
 
   get xml/device_description.xml
   for k in "${keys[@]}"; do
-    # The root device's fields come before those of its embedded devices
+    # The root device's fields precede its embedded devices'
     [[ $REPLY =~ "<$k>"([^<]*)"</$k>" ]] || continue
     v=${BASH_REMATCH[1]//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
-    v=${v//[[:cntrl:]]/}
+    v=${v//[[:cntrl:]]/} v=${v//$C1/}
     [[ -n $1 ]] && printf '%s\n' "$v" || printf '%s=%s\n' "$k" "$v"
   done
 }
@@ -94,7 +97,8 @@ didl() {
   # Escaped twice: DIDL-Lite text inside SOAP; the match stops at &l, so the outer level holds no &lt;
   v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
   v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
-  printf -v "$1" %s "${v//[[:cntrl:]]/}"
+  v=${v//[[:cntrl:]]/}
+  printf -v "$1" %s "${v//$C1/}"
 }
 
 # List favorites, or play favorite n; containers go through the queue - [n]
@@ -135,7 +139,7 @@ file() {
   local LC_ALL=C c i n uri=${1#//}
 
   [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
-  # Percent-encode the bytes outside the unreserved set, if there are any
+  # Percent-encode bytes outside the unreserved set, if any
   if [[ $uri == *[^[:alnum:]/._~+-]* ]]; then
     uri=''
     for ((i = 2; i < ${#1}; i++)); do
@@ -167,23 +171,8 @@ isnum() {
   [[ $1 =~ ^([+-]?)(0|[1-9][0-9]{0,3})$ && ${BASH_REMATCH[2]} -le $2 ]]
 }
 
-# Get or set status light - [0..1]
-led() {
-  local states=(Off On)
-
-  if [[ -z $1 ]]; then
-    soap "$DP" GetLEDState
-    tag CurrentLEDState 'On|Off'
-    [[ ${BASH_REMATCH[1]} == On ]] && printf '1\n' || printf '0\n'
-  elif [[ $1 =~ ^[01]$ ]]; then
-    soap "$DP" SetLEDState "<DesiredLEDState>${states[$1]}</DesiredLEDState>"
-  else
-    error 201
-  fi
-}
-
-# Print a container's items as "n) artist / title [album]", with "> " for item cur if its res is uri;
-# the speaker caps each reply, so read on until TotalMatches - <object id> [cur] [uri]
+# Print a container's items as "n) artist / title [album]", "> " marking item cur if its res is uri;
+# replies are capped, so read on to TotalMatches - <object id> [cur] [uri]
 list() {
   # C: faster splitting; in a variable, as Bash 3.2 takes a quoted / in a pattern for the separator
   local LC_ALL=C e='&lt;/item&gt;' i=0 it items j n t
@@ -259,6 +248,21 @@ now() {
     "${src:-UNKNOWN}"
 }
 
+# Get or set an On/Off device property as 0 or 1 - <property> <state for 0> <state for 1> [0..1]
+onoff() {
+  local states=("$2" "$3")
+
+  if [[ -z $4 ]]; then
+    soap "$DP" "Get$1"
+    tag "Current$1" 'On|Off'
+    [[ ${BASH_REMATCH[1]} == "$3" ]] && printf '1\n' || printf '0\n'
+  elif [[ $4 =~ ^[01]$ ]]; then
+    soap "$DP" "Set$1" "<Desired$1>${states[$4]}</Desired$1>"
+  else
+    error 201
+  fi
+}
+
 # Get or set repeat (0 off, 1 one, 2 all) or shuffle - <0 repeat | 1 shuffle> [arg]
 playmode() {
   local i modes=(NORMAL REPEAT_ONE REPEAT_ALL SHUFFLE_NOREPEAT SHUFFLE_REPEAT_ONE SHUFFLE) r s
@@ -286,7 +290,6 @@ playmode() {
   fi
 }
 
-# Pause while playing, otherwise play
 playpause() {
   soap "$AVT" GetTransportInfo
   tag CurrentTransportState '[A-Z_]{1,32}'
@@ -418,7 +421,7 @@ speech() {
       tag CurrentValue '[0-4]'
       printf '%s\n' "${BASH_REMATCH[1]}"
     else
-      # Off: the level doesn't matter, so don't ask for it
+      # Off: no need to ask for the level
       printf '0\n'
     fi
   elif [[ $1 =~ ^[0-4]$ ]]; then
@@ -451,6 +454,19 @@ timer() {
   fi
 }
 
+# Get or set Trueplay tuning - [0..1]
+trueplay() {
+  if [[ -z $1 ]]; then
+    soap "$RC" GetRoomCalibrationStatus
+    tag RoomCalibrationEnabled '[01]'
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ $1 =~ ^[01]$ ]]; then
+    soap "$RC" SetRoomCalibrationStatus "<RoomCalibrationEnabled>$1</RoomCalibrationEnabled>"
+  else
+    error 201
+  fi
+}
+
 # Switch to the TV input; the stream URI needs this player's id
 tv() {
   local id
@@ -463,27 +479,32 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 2.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.0 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
 
 Playback:
-  artwork | next | now | pause | play | prev | stop
+  next | pause | play | prev | stop
   repeat 0..2 | seek 0..3599 | shuffle 0..1
+  artwork | now | sleep 0..120
 
 Sources:
   favorites 1..n | file //host/share/path | tv
+  clear | queue 1..n | rescan
 
-Queue:
-  clear | queue 1..n
+Sound:
+  bass -10..10 | limit 1..100 | loudness 0..1 | mute 0..1
+  treble -10..10 | trueplay 0..1 | vol 0..100
 
-Audio:
-  bass -10..10 | height -10..10 | lipsync 0..5 | loudness 0..1 | mute 0..1
-  night 0..1 | speech 0..4 | treble -10..10 | vol 0..100
+Home theater:
+  height -10..10 | lipsync 0..5 | night 0..1 | speech 0..4
 
-Other:
-  about | led 0..1 | sleep 0..120
+Sub audio:
+  level -15..15 | phase 0..1 | sub 0..1
+
+Hardware:
+  about | led 0..1 | touch 0..1
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
@@ -492,14 +513,17 @@ About accepts a key (e.g. about modelName).
 Requires SONOS_IP: the speaker's IP address or .local name."
 }
 
-# Get or set min..max value - <service> <action> <element> <arguments> <min> <max> [arg]
+# Get or set a min..max RenderingControl value, EQ by its type - <action> <arguments | EQ type> <min> <max> [arg]
 value() {
-  if [[ -z $7 ]]; then
-    soap "$1" "Get$2" "$4"
-    tag "Current$3" '-?[0-9]{1,3}'
+  local a=$2 e=$1
+
+  [[ $1 != EQ ]] || a="<EQType>$2</EQType>" e=Value
+  if [[ -z $5 ]]; then
+    soap "$RC" "Get$1" "$a"
+    tag "Current$e" '-?[0-9]{1,3}'
     printf '%s\n' "${BASH_REMATCH[1]}"
-  elif [[ $7 =~ ^(0|-?[1-9][0-9]{0,2})$ ]] && (($7 >= $5 && $7 <= $6)); then
-    soap "$1" "Set$2" "$4<Desired$3>$7</Desired$3>"
+  elif [[ $5 =~ ^(0|-?[1-9][0-9]{0,2})$ ]] && (($5 >= $3 && $5 <= $4)); then
+    soap "$RC" "Set$1" "$a<Desired$e>$5</Desired$e>"
   else
     error 201
   fi
@@ -511,16 +535,15 @@ volume() {
     # The speaker clamps to 0..100
     soap "$RC" SetRelativeVolume "$CH<Adjustment>${BASH_REMATCH[0]#+}</Adjustment>"
   else
-    value "$RC" Volume Volume "$CH" 0 100 "$1"
+    value Volume "$CH" 0 100 "$1"
   fi
 }
 
 (($# < 3)) || error 201
 opt=${1-} arg=${2-}
 
-# No-argument options
 case $opt in
-'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | stop | tv)
+'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | stop | tv)
   (($# < 2)) || error 201
   ;;
 esac
@@ -553,6 +576,9 @@ seek)
 shuffle)
   playmode 1 "$arg"
   ;;
+sleep)
+  timer "$arg"
+  ;;
 stop)
   soap "$AVT" Stop
   ;;
@@ -571,41 +597,61 @@ clear)
 queue | playqueue)
   queue "$arg"
   ;;
+rescan)
+  # Empty: keep the library's album artist setting
+  soap MediaServer/ContentDirectory RefreshShareIndex '<AlbumArtistDisplayOption></AlbumArtistDisplayOption>'
+  ;;
 bass)
-  value "$RC" Bass Bass '' -10 10 "$arg"
+  value Bass '' -10 10 "$arg"
   ;;
 height)
-  value "$RC" EQ Value '<EQType>HeightChannelLevel</EQType>' -10 10 "$arg"
+  value EQ HeightChannelLevel -10 10 "$arg"
+  ;;
+limit)
+  value EQ VolumeScalingFactor 1 100 "$arg"
   ;;
 lipsync)
-  value "$RC" EQ Value '<EQType>AudioDelay</EQType>' 0 5 "$arg"
+  value EQ AudioDelay 0 5 "$arg"
   ;;
 loudness)
-  value "$RC" Loudness Loudness "$CH" 0 1 "$arg"
+  value Loudness "$CH" 0 1 "$arg"
   ;;
 mute)
-  value "$RC" Mute Mute "$CH" 0 1 "$arg"
+  value Mute "$CH" 0 1 "$arg"
   ;;
 night)
-  value "$RC" EQ Value '<EQType>NightMode</EQType>' 0 1 "$arg"
+  value EQ NightMode 0 1 "$arg"
   ;;
 speech)
   speech "$arg"
   ;;
 treble)
-  value "$RC" Treble Treble '' -10 10 "$arg"
+  value Treble '' -10 10 "$arg"
+  ;;
+trueplay)
+  trueplay "$arg"
   ;;
 vol | volume)
   volume "$arg"
+  ;;
+level)
+  value EQ SubGain -15 15 "$arg"
+  ;;
+phase)
+  value EQ SubPolarity 0 1 "$arg"
+  ;;
+sub)
+  value EQ SubEnable 0 1 "$arg"
   ;;
 about)
   about "$arg"
   ;;
 led)
-  led "$arg"
+  onoff LEDState Off On "$arg"
   ;;
-sleep)
-  timer "$arg"
+touch)
+  # The speaker locks the buttons: touch controls are on while the lock is off
+  onoff ButtonLockState On Off "$arg"
   ;;
 '' | -h | --help | help)
   usage

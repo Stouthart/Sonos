@@ -1,4 +1,4 @@
-<!-- 2.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,15 +13,15 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 2.0**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.0**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
-- **Bash** 3.2 or newer (the version macOS ships is fine). `soc.sh` needs Bash's `/dev/tcp`, which the macOS Bash has.
+- **Bash** 3.2 or newer (the version macOS ships is fine). `soc.sh` needs Bash's `/dev/tcp`, which the macOS Bash has. It starts Bash in the C locale with `#!/usr/bin/env -S LC_ALL=C bash`, which needs an `env` that takes `-S` (macOS, FreeBSD, GNU coreutils 8.30 or newer); elsewhere, run it as `bash soc.sh`. `soc-curl.sh` has a plain `#!/usr/bin/env bash` and runs anywhere.
 - **curl** 7.76 or newer, for `soc-curl.sh` only (macOS ships it)
 - A Sonos speaker reachable on your network
 
-Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.1). Other Sonos speakers should work; `night`, `speech`, `height`, `lipsync` and `tv` need a soundbar that has those settings. Linux and Windows (Git Bash, WSL) should work but are untested.
+Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.1). Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
 
 ## Installation
 
@@ -55,30 +55,37 @@ Add that line to your `~/.zshrc` or `~/.bashrc` to make it permanent. The Sonos 
 soc.sh <option> [argument]
 ```
 
-Options print the current value when called without an argument. Only `vol` and `seek` accept a **relative** value prefixed with `+` or `-`; for `bass`, `treble` and `height` a minus sign is part of the value. Write numbers without leading zeros: `vol 8`, not `vol 08`.
+Options print the current value when called without an argument. Only `seek` and `vol` accept a **relative** value prefixed with `+` or `-`; for `bass`, `treble`, `height` and `level` a minus sign is part of the value. Write numbers without leading zeros: `vol 8`, not `vol 08`.
 
 Options that only act (`play`, `vol 40`) print nothing; the exit code tells you whether they worked. An option that takes no argument rejects one, so `stop now` fails rather than stopping. Arguments are checked before anything is sent.
 
+`help`, or no arguments at all, prints the built-in usage screen; `-h` and `--help` do the same.
+
 ### Playback
 
-| Option           | Description                                  |
-| ---------------- | -------------------------------------------- |
-| `now`            | Show formatted now playing info              |
-| `artwork`        | Show the artwork URL for the current track   |
-| `play` / `stop`  | Transport control                            |
-| `pause`          | Pause while playing, otherwise play          |
-| `next` / `prev`  | Skip track (alias: `previous`)               |
-| `seek [0..3599]` | Get the position in seconds, or seek to it   |
-| `shuffle [0..1]` | Get or set shuffle                           |
-| `repeat [0..2]`  | Get or set repeat: 0 off, 1 one track, 2 all |
+| Option           | Description                                               |
+| ---------------- | --------------------------------------------------------- |
+| `next`           | Skip to the next track                                    |
+| `pause`          | Pause while playing, otherwise play                       |
+| `play`           | Start or resume playback                                  |
+| `prev`           | Skip to the previous track (alias: `previous`)            |
+| `stop`           | Stop playback                                             |
+| `repeat [0..2]`  | Get or set repeat: 0 off, 1 one track, 2 all              |
+| `seek [0..3599]` | Get the position in seconds, or seek to it                |
+| `shuffle [0..1]` | Get or set shuffle                                        |
+| `artwork`        | Show the artwork URL for the current track                |
+| `now`            | Show formatted now playing info                           |
+| `sleep [0..120]` | Show the sleep timer, set it in minutes, or cancel it (0) |
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
-
-`artwork` prints the URL of the current track's artwork, either the streaming service's own link or an image the speaker serves itself, so `open -u "$(soc.sh artwork)"` shows it on macOS. With no artwork it prints nothing and succeeds.
+`repeat` and `shuffle` set one combined play mode, so each first reads the current mode; a value that is already set sends nothing.
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds or a `min:sec` position (`seek 219` and `seek 3:39` are the same jump), either with an optional `+` or `-`. Both forms top out at `3599` and `59:59`, and the seconds in `min:sec` are always two digits. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
 
-`shuffle` and `repeat` set one combined play mode, so each first reads the current mode; a value that is already set sends nothing.
+`artwork` prints the URL of the current track's artwork, either the streaming service's own link or an image the speaker serves itself. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
+
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
+
+`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
 
 ### Sources
 
@@ -87,6 +94,9 @@ A bare `seek` prints the position in whole seconds. To move, pass seconds or a `
 | `favorites [1..n]` | List favorites, or play favorite _n_ (aliases: `favourites`, `favs`) |
 | `file <path>`      | Play a file from an SMB share                                        |
 | `tv`               | Switch to the TV input                                               |
+| `clear`            | Empty the queue                                                      |
+| `queue [1..n]`     | List the queue, or play from track _n_ (alias: `playqueue`)          |
+| `rescan`           | Scan the music library for new content                               |
 
 `favorites` lists the app's **Sonos Favorites**, numbered from 1 in the app's order. `favorites 2` plays the second: a station or track replaces what is playing, and a playlist or album is added to the end of the queue and played from its first track. Some favorites are only shortcuts into the app, such as the Sonos Radio ones Sonos adds itself; they have nothing to play over UPnP and exit `205`. Playing a station or playlist favorite is untested so far, as the test speaker has only shortcuts.
 
@@ -94,52 +104,68 @@ A bare `seek` prints the position in whole seconds. To move, pass seconds or a `
 
 `tv` first looks up the speaker's own player ID, which the TV input's address contains, as does the queue's.
 
-### Queue
-
-| Option         | Description                                                 |
-| -------------- | ----------------------------------------------------------- |
-| `queue [1..n]` | List the queue, or play from track _n_ (alias: `playqueue`) |
-| `clear`        | Empty the queue                                             |
-
 The queue is numbered from 1, and the current track is marked with a leading `>`. Entries are laid out like the first line of `now`. Nothing is marked while another source plays, such as Spotify Connect. `queue 5` plays from track 5, and switches to the queue first when another source is playing. `clear` is the app's **Clear queue**.
 
-`queue` and `favorites` read on while the speaker caps a reply, until they have every entry. Before Bash 4.1 they read 100 entries at a time, as older Bash splits long text slowly.
+`favorites` and `queue` read on while the speaker caps a reply, until they have every entry. Before Bash 4.1 they read 100 entries at a time, as older Bash splits long text slowly.
 
-### Audio
+`rescan` is the app's **Scan for new content**: the speaker rescans the shares in its music library, to pick up files added since. It returns at once while the speaker scans; starting it again during a scan restarts the scan.
 
-| Option             | Description                                      |
-| ------------------ | ------------------------------------------------ |
-| `vol [0..100]`     | Get or set volume (alias: `volume`)              |
-| `mute [0..1]`      | Get or set mute                                  |
-| `bass [-10..10]`   | Get or set bass                                  |
-| `treble [-10..10]` | Get or set treble                                |
-| `loudness [0..1]`  | Get or set loudness                              |
-| `night [0..1]`     | Get or set Night Sound                           |
-| `speech [0..4]`    | Get or set Speech Enhancement: 0 off, 1..4 level |
-| `height [-10..10]` | Get or set the height channel level              |
-| `lipsync [0..5]`   | Get or set TV dialog sync: 0 off, 1..5 delay     |
+### Sound
+
+| Option             | Description                             |
+| ------------------ | --------------------------------------- |
+| `bass [-10..10]`   | Get or set bass                         |
+| `limit [1..100]`   | Get or set the volume limit, in percent |
+| `loudness [0..1]`  | Get or set loudness                     |
+| `mute [0..1]`      | Get or set mute                         |
+| `treble [-10..10]` | Get or set treble                       |
+| `trueplay [0..1]`  | Get or set Trueplay tuning              |
+| `vol [0..100]`     | Get or set volume (alias: `volume`)     |
+
+`limit` is the app's **Volume limit**, in percent. The speaker scales the volume to it rather than capping it: `vol` still runs from 0 to 100, but plays quieter.
+
+`trueplay` is the app's **Trueplay tuning** switch: `trueplay 0` turns the room's tuning off, `trueplay 1` back on. Tuning or retuning the room needs the app. While Trueplay is off, the app also shows the Sub's Phase control (`phase`).
 
 A relative `vol` is applied by the speaker, which keeps the result within 0..100.
 
-`night` is the app's **Night Sound**. `height` is the app's **Height level**, the height channel level for immersive audio formats.
+### Home theater
 
-`speech` is the app's **Speech Enhancement**, where 1..4 are its four levels, from low to max. The speaker keeps the on/off switch and the level as separate settings: a bare `speech` reads both in one go and prints the level, or `0` when it is off. `speech 0` turns the switch off and leaves the level alone.
+| Option             | Description                                      |
+| ------------------ | ------------------------------------------------ |
+| `height [-10..10]` | Get or set the height channel level              |
+| `lipsync [0..5]`   | Get or set TV dialog sync: 0 off, 1..5 delay     |
+| `night [0..1]`     | Get or set Night Sound                           |
+| `speech [0..4]`    | Get or set Speech Enhancement: 0 off, 1..4 level |
+
+`height` is the app's **Height level**, the height channel level for immersive audio formats.
 
 `lipsync` is the app's **TV dialog sync**, also listed as **Audio delay (lip sync)**: it delays the sound from the TV, from `0` (none) to `5` (most), to match a picture that lags behind it. The speaker refuses other values.
 
-### Other
+`night` is the app's **Night Sound**.
 
-| Option           | Description                                               |
-| ---------------- | --------------------------------------------------------- |
-| `about [key]`    | Show model, room, software, hardware, serial and MAC      |
-| `led [0..1]`     | Get or set the status light                               |
-| `sleep [0..120]` | Show the sleep timer, set it in minutes, or cancel it (0) |
+`speech` is the app's **Speech Enhancement**, where 1..4 are its four levels, from low to max. The speaker keeps the on/off switch and the level as separate settings: a bare `speech` reads both in one go and prints the level, or `0` when it is off. `speech 0` turns the switch off and leaves the level alone.
+
+### Sub audio
+
+| Option            | Description                                |
+| ----------------- | ------------------------------------------ |
+| `level [-15..15]` | Get or set the Sub level                   |
+| `phase [0..1]`    | Get or set Phase control: 0 = 0°, 1 = 180° |
+| `sub [0..1]`      | Get or set Sonos Sub: 0 off, 1 on          |
+
+`level` is the app's **Sub level**, from `-15` to `15`. `phase` is the app's **Phase control**, which the app shows only while Trueplay tuning is off (`trueplay 0`): `phase 1` inverts the Sub's phase (180°), `phase 0` sets it back (0°). `sub` is the app's **Sonos Sub** switch: `sub 0` turns the Sub off and leaves its level alone. All three need a Sub bonded to the speaker.
+
+### Hardware
+
+| Option         | Description                                          |
+| -------------- | ---------------------------------------------------- |
+| `about [key]`  | Show model, room, software, hardware, serial and MAC |
+| `led [0..1]`   | Get or set the status light                          |
+| `touch [0..1]` | Get or set the touch controls                        |
 
 `about` prints the speaker's details as `key=value`, under the speaker's own field names: `modelName`, `modelNumber`, `roomName`, `displayVersion` (the Sonos software version the app shows), `softwareVersion` (its build), `hardwareVersion`, `serialNum`, `MACAddress` and `apiVersion`. `about <key>` prints one value, and takes any field of the speaker's device description, such as `about memory`; a field the speaker doesn't have prints nothing.
 
-`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
-
-`help`, or no arguments at all, prints the built-in usage screen; `-h` and `--help` do the same.
+`touch` is the app's **Touch controls**: `touch 0` turns the speaker's touch controls off, so touching it does nothing, and `touch 1` turns them back on.
 
 ## Examples
 
@@ -148,6 +174,7 @@ soc.sh vol                   # -> 30
 soc.sh vol 25                # set volume to 25
 soc.sh vol +5                # five louder
 soc.sh mute 1                # mute
+soc.sh limit 80              # volume limit: 80%
 
 soc.sh now
 # Massive Attack / Teardrop [Mezzanine]
@@ -178,10 +205,17 @@ soc.sh speech 3              # Speech Enhancement, third level
 soc.sh night 1               # Night Sound on
 soc.sh height -2             # a little less height
 soc.sh lipsync 2             # delay the TV's sound a little
+soc.sh trueplay 0            # Trueplay tuning off
+
+soc.sh level                 # -> -2
+soc.sh level 3               # a little more Sub
+soc.sh phase 1               # Sub phase 180°
+soc.sh sub 0                 # Sub off
 
 soc.sh sleep 45              # sleep timer: 45 minutes
 soc.sh sleep                 # -> 00:44:59
 soc.sh sleep 0               # cancel it
+soc.sh touch 0               # touch controls off
 
 soc.sh about                 # modelName=Sonos Beam Ultra, roomName=..., ...
 soc.sh about displayVersion  # -> 27.1
@@ -224,13 +258,14 @@ Pass `--xdbg` as the very first argument to trace execution with per-line timing
 
 - The UPnP actions are Sonos's own and unofficial. They may change with a software update.
 - Requests are plain HTTP on the local network, without authentication. Anything on the same network can control the speaker.
-- Text from the speaker is stripped of control characters before it is printed, so it pastes cleanly into a terminal or a pipe.
+- Text from the speaker is stripped of control characters, C1 controls included, before it is printed, so it pastes cleanly into a terminal or a pipe.
 
 ### Device quirks
 
 - **Spotify Connect** runs through the speaker's Virtual Line-In. Skipping and seeking work, but the speaker accepts shuffle and repeat changes and then ignores them: set those in Spotify. Seeking while paused resumes playback.
 - **No bit rate:** the speaker reports sample rate, bit depth and whether a stream is lossless, but no bit rate.
 - **Speech Enhancement level 0** is accepted but ignored by the speaker, which is why `speech 0` uses the separate switch.
+- **Sub level** is stored as sent, even far outside the app's -15..15, so `level` checks the range before sending.
 - **No remote restart:** the speaker's old `/reboot` page answers `403 Forbidden`, and the restart the app uses needs a Sonos account login.
 
 ## Credits
