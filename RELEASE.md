@@ -1,8 +1,20 @@
-<!-- 3.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per major version, newest first. 3.0 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.1 is the version distributed; the entries below it show how the scripts got there.
+
+## 3.1 - October 2026
+
+`about` lists what the app shows, `settings` the speaker's settings, `now` the TV's sound format, and fixes for Android, where `soc.sh queue` failed with `Invalid response from Sonos.` when a title in the queue had an accent or another non-ASCII character. Bash on Android counts characters rather than bytes in every locale, `LC_ALL=C` included, so the scripts now count bytes themselves wherever the speaker's protocol needs it. Tested in Termux.
+
+- **`now` on the TV input shows the format the TV sends** where music shows its quality, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+`, `TrueHD` or `MAT`.
+- **`about` follows the app's About your system**, in its order: `displayName` (the model, as the app names it), `roomName`, `serialNum`, `swGen` (S1 or S2), `softwareVersion` (the app's Build) and `hardwareVersion`, then `displayVersion` and `apiVersion` as before. The others it printed, such as `modelName` and `MACAddress`, are one `about <key>` away.
+- **New `settings`**, in the Hardware section, prints the settings of Sound (`vol` and `mute` aside), Home theater, Sub audio and Hardware as `option=value`. Each line works as a command again, so a saved copy puts the settings back. `soc.sh` asks for them seven at a time, in about half the time of one by one.
+- **`favorites`, `queue` and `about` in `soc.sh`** read a reply the speaker sends in chunks correctly on Android, whatever its text. A title such as `Hernán Cattáneo` before the last chunk made `soc.sh` lose its place in the reply, and exit `202`.
+- **`favorites <n>` in `soc.sh`** sends the request's length in bytes on Android, for a favorite whose name has non-ASCII characters. It sent the number of characters before.
+- **`file`** percent-encodes non-ASCII characters as UTF-8 on Android, as it does elsewhere, in both scripts: `Café` becomes `Caf%C3%A9`, where Android sent it unencoded, and `€` becomes `%E2%82%AC` rather than `%AC`.
+- **On the Mac the fixes change nothing:** the output is the same, and where Bash counts bytes `soc.sh` skips the extra work, for about a microsecond per request.
 
 ## 3.0 - October 2026
 

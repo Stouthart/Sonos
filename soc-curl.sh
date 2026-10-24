@@ -43,8 +43,7 @@ error() {
 
 # Print the speaker's details as key=value, or one device description field - [key]
 about() {
-  local k keys=(modelName modelNumber roomName displayVersion softwareVersion hardwareVersion
-    serialNum MACAddress apiVersion) v
+  local k keys=(displayName roomName serialNum swGen softwareVersion hardwareVersion displayVersion apiVersion) v
 
   if [[ -n $1 ]]; then
     [[ $1 =~ ^[[:alnum:]]{2,32}$ ]] || error 201
@@ -136,20 +135,30 @@ favorites() {
 
 # Play a file from an SMB share the speaker can read - <//host/share/path>
 file() {
-  local LC_ALL=C c i n uri=${1#//}
+  local LC_ALL=C b c i k n uri=${1#//}
 
   [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
-  # Percent-encode bytes outside the unreserved set, if any
-  if [[ $uri == *[^[:alnum:]/._~+-]* ]]; then
+  # Percent-encode bytes outside the unreserved set, if any; spelled out, as Android's [[:alnum:]] takes é
+  if [[ $uri == *[^0-9A-Za-z/._~+-]* ]]; then
     uri=''
     for ((i = 2; i < ${#1}; i++)); do
       c=${1:i:1}
       case $c in
-      [[:alnum:]/._~+-]) uri+=$c ;;
+      [0-9A-Za-z/._~+-]) uri+=$c ;;
       *)
         # Bash 3.2 sign-extends bytes above 0x7F
         printf -v n %d "'$c"
-        printf -v c %%%02X $((n & 255))
+        printf -v b %.1s "$c"
+        if [[ $b == "$c" ]]; then
+          printf -v c %%%02X $((n & 255))
+        else
+          # A character, as Android's Bash takes one in every locale: its UTF-8 bytes from the code point
+          ((k = 1 + (n > 2047) + (n > 65535)))
+          printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
+          while ((k--)); do
+            printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
+          done
+        fi
         uri+=$c
         ;;
       esac
@@ -209,9 +218,9 @@ list() {
   done
 }
 
-# Print "artist / title [album]", then position, duration, quality and source
+# Print "artist / title [album]", then position, duration, quality (TV: input format) and source
 now() {
-  local bits=0 dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src
+  local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
 
   soap "$AVT" GetPositionInfo
   secs pos RelTime
@@ -244,6 +253,20 @@ now() {
   ((bits)) && bits=" ${bits}bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
   desc ''
+  if [[ $src == tv ]]; then
+    # The input format's code, by name; an unknown one shows as a number
+    soap "$DP" GetZoneInfo
+    tag HTAudioIn '[0-9]{1,10}'
+    c=${BASH_REMATCH[1]}
+    tvf='|0=No input connected|2=Stereo|7=Dolby Digital 2.0|18=Dolby Digital 5.1|21=No input|22=No audio'
+    tvf+='|59=Dolby Atmos (DD+)|61=Dolby Atmos (TrueHD)|63=Dolby Atmos (MAT)|33554434=PCM 2.0|33554454=PCM 2.0 no audio'
+    tvf+='|33554488=Dolby Digital 2.0|33554490=Dolby Digital Plus 2.0|33554492=Dolby TrueHD 2.0'
+    tvf+='|33554494=Dolby Multichannel PCM 2.0|84934658=Multichannel PCM 5.1|84934713=Dolby Digital 5.1'
+    tvf+='|84934714=Dolby Digital Plus 5.1|84934716=Dolby TrueHD 5.1|84934718=Dolby Multichannel PCM 5.1'
+    tvf+='|84934721=DTS 5.1|118489090=Multichannel PCM 7.1|118489146=Dolby Digital Plus 7.1'
+    tvf+='|118489148=Dolby TrueHD 7.1'
+    [[ $tvf =~ "|$c="([^|]*) ]] && q+=" ${BASH_REMATCH[1]}" || q+=" format $c"
+  fi
   printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
     "${src:-UNKNOWN}"
 }
@@ -408,6 +431,47 @@ soap() {
   reply "$2" "$rc"
 }
 
+# Print the Sound (vol and mute aside), Home theater, Sub audio and Hardware settings as option=value
+settings() {
+  local i out='' p v=()
+  # Option, then the request for its value; speech takes two, its switch (no option) and level
+  local r=(
+    bass "$RC" GetBass ''
+    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
+    loudness "$RC" GetLoudness "$CH"
+    treble "$RC" GetTreble ''
+    trueplay "$RC" GetRoomCalibrationStatus ''
+    height "$RC" GetEQ '<EQType>HeightChannelLevel</EQType>'
+    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
+    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    '' "$RC" GetEQ '<EQType>SpeechEnhanceEnabled</EQType>'
+    speech "$RC" GetEQ '<EQType>DialogLevel</EQType>'
+    level "$RC" GetEQ '<EQType>SubGain</EQType>'
+    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
+    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
+    led "$DP" GetLEDState ''
+    touch "$DP" GetButtonLockState ''
+  )
+
+  # One at a time, as in speech
+  for ((i = 0; i < ${#r[@]}; i += 4)); do
+    soap "${r[i + 1]}" "${r[i + 2]}" "${r[i + 3]}"
+    # The reply's first value; RoomCalibrationEnabled comes before Available
+    [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
+    [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
+    v+=("${BASH_REMATCH[1]}")
+  done
+
+  # Speech is 0 while off; LED On is 1; the touch controls are on (1) while the buttons aren't locked
+  ((v[8])) || v[9]=0
+  [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0
+  [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0
+  for ((i = 0; i < ${#r[@]}; i += 4)); do
+    [[ -z ${r[i]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
+  done
+  printf %s "$out"
+}
+
 # Get or set speech enhancement (0 off, 1..4 level) - [arg]
 speech() {
   local dl='<EQType>DialogLevel</EQType>' se='<EQType>SpeechEnhanceEnabled</EQType>'
@@ -479,7 +543,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -504,7 +568,7 @@ Sub audio:
   level -15..15 | phase 0..1 | sub 0..1
 
 Hardware:
-  about | led 0..1 | touch 0..1
+  about | led 0..1 | settings | touch 0..1
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
@@ -543,7 +607,7 @@ volume() {
 opt=${1-} arg=${2-}
 
 case $opt in
-'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | stop | tv)
+'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | settings | stop | tv)
   (($# < 2)) || error 201
   ;;
 esac
@@ -648,6 +712,9 @@ about)
   ;;
 led)
   onoff LEDState Off On "$arg"
+  ;;
+settings)
+  settings
   ;;
 touch)
   # The speaker locks the buttons: touch controls are on while the lock is off

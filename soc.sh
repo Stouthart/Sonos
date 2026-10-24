@@ -13,6 +13,8 @@ RD=(-d '') PG=100
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
 # C1 controls (U+0080..U+009F) in UTF-8, which [[:cntrl:]] only matches in a UTF-8 locale
 C1=$'\xc2[\x80-\x9f]'
+# A 2-byte character: its length shows whether Bash counts bytes (C locale) or characters (UTF-8; Android always)
+MB=$'\xc3\xa9'
 
 [[ ${1-} == --xdbg ]] && {
   shift
@@ -41,8 +43,7 @@ error() {
 
 # Print the speaker's details as key=value, or one device description field - [key]
 about() {
-  local k keys=(modelName modelNumber roomName displayVersion softwareVersion hardwareVersion
-    serialNum MACAddress apiVersion) v
+  local k keys=(displayName roomName serialNum swGen softwareVersion hardwareVersion displayVersion apiVersion) v
 
   if [[ -n $1 ]]; then
     [[ $1 =~ ^[[:alnum:]]{2,32}$ ]] || error 201
@@ -76,7 +77,7 @@ browse() {
 
 # Set REPLY to its body, joined if chunked: <hex size> CRLF <data> CRLF, up to size 0; sizes count bytes
 dechunk() {
-  local LC_ALL=C b i=0 n
+  local b c i=0 n
 
   b=${REPLY#*$'\r\n\r\n'}
   if [[ ${REPLY:0:${#REPLY}-${#b}} != *[Cc]hunked* ]]; then
@@ -86,8 +87,11 @@ dechunk() {
   # By offset: cutting each chunk off the front copies the rest every time
   REPLY=''
   while [[ ${b:i:10} =~ ^([[:xdigit:]]{1,8})$'\r\n' ]] && ((n = 16#${BASH_REMATCH[1]})); do
-    REPLY+=${b:i+${#BASH_REMATCH[0]}:n}
-    ((i += ${#BASH_REMATCH[0]} + n + 2))
+    c=${b:i+${#BASH_REMATCH[0]}:n}
+    # Counting characters, that took n of them: printf's precision cuts n bytes, and ${#c} counts them as ${b:…} does
+    ((${#MB} == 2)) || printf -v c '%.*s' "$n" "$c"
+    REPLY+=$c
+    ((i += ${#BASH_REMATCH[0]} + ${#c} + 2))
   done
   [[ ${b:i:3} == 0$'\r\n' ]] || error 202
 }
@@ -119,8 +123,7 @@ didl() {
 
 # List favorites, or play favorite n; containers go through the queue - [n]
 favorites() {
-  # C: byte lengths for Content-Length
-  local LC_ALL=C md='' uri
+  local md='' uri
 
   if [[ -z $1 ]]; then
     browse 3 FV:2
@@ -155,20 +158,30 @@ favorites() {
 
 # Play a file from an SMB share the speaker can read - <//host/share/path>
 file() {
-  local LC_ALL=C c i n uri=${1#//}
+  local LC_ALL=C b c i k n uri=${1#//}
 
   [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
-  # Percent-encode bytes outside the unreserved set, if any
-  if [[ $uri == *[^[:alnum:]/._~+-]* ]]; then
+  # Percent-encode bytes outside the unreserved set, if any; spelled out, as Android's [[:alnum:]] takes é
+  if [[ $uri == *[^0-9A-Za-z/._~+-]* ]]; then
     uri=''
     for ((i = 2; i < ${#1}; i++)); do
       c=${1:i:1}
       case $c in
-      [[:alnum:]/._~+-]) uri+=$c ;;
+      [0-9A-Za-z/._~+-]) uri+=$c ;;
       *)
         # Bash 3.2 sign-extends bytes above 0x7F
         printf -v n %d "'$c"
-        printf -v c %%%02X $((n & 255))
+        printf -v b %.1s "$c"
+        if [[ $b == "$c" ]]; then
+          printf -v c %%%02X $((n & 255))
+        else
+          # A character, as Android's Bash takes one in every locale: its UTF-8 bytes from the code point
+          ((k = 1 + (n > 2047) + (n > 65535)))
+          printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
+          while ((k--)); do
+            printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
+          done
+        fi
         uri+=$c
         ;;
       esac
@@ -238,9 +251,9 @@ list() {
   done
 }
 
-# Print "artist / title [album]", then position, duration, quality and source
+# Print "artist / title [album]", then position, duration, quality (TV: input format) and source
 now() {
-  local bits=0 dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src
+  local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
 
   soap "$AVT" GetPositionInfo
   secs pos RelTime
@@ -273,6 +286,20 @@ now() {
   ((bits)) && bits=" ${bits}bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
   desc ''
+  if [[ $src == tv ]]; then
+    # The input format's code, by name; an unknown one shows as a number
+    soap "$DP" GetZoneInfo
+    tag HTAudioIn '[0-9]{1,10}'
+    c=${BASH_REMATCH[1]}
+    tvf='|0=No input connected|2=Stereo|7=Dolby Digital 2.0|18=Dolby Digital 5.1|21=No input|22=No audio'
+    tvf+='|59=Dolby Atmos (DD+)|61=Dolby Atmos (TrueHD)|63=Dolby Atmos (MAT)|33554434=PCM 2.0|33554454=PCM 2.0 no audio'
+    tvf+='|33554488=Dolby Digital 2.0|33554490=Dolby Digital Plus 2.0|33554492=Dolby TrueHD 2.0'
+    tvf+='|33554494=Dolby Multichannel PCM 2.0|84934658=Multichannel PCM 5.1|84934713=Dolby Digital 5.1'
+    tvf+='|84934714=Dolby Digital Plus 5.1|84934716=Dolby TrueHD 5.1|84934718=Dolby Multichannel PCM 5.1'
+    tvf+='|84934721=DTS 5.1|118489090=Multichannel PCM 7.1|118489146=Dolby Digital Plus 7.1'
+    tvf+='|118489148=Dolby TrueHD 7.1'
+    [[ $tvf =~ "|$c="([^|]*) ]] && q+=" ${BASH_REMATCH[1]}" || q+=" format $c"
+  fi
   printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
     "${src:-UNKNOWN}"
 }
@@ -369,14 +396,15 @@ queue() {
   list Q:0 "$cur" "$uri"
 }
 
-# Read fd 3 or 4 to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
+# Read an fd to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
 recv() {
   local rc=0
 
   IFS= read -r "${RD[@]}" REPLY <&"$1" || rc=$?
   case $1 in
   3) exec 3<&- ;;
-  *) exec 4<&- ;;
+  4) exec 4<&- ;;
+  *) eval "exec $1<&-" ;;
   esac
 
   # As in get; only Browse replies come chunked, but checking costs just ~6 µs
@@ -437,22 +465,73 @@ seek() {
   soap "$AVT" Seek "<Unit>$unit</Unit><Target>$val</Target>"
 }
 
-# Connect fd 3 or 4 and send a UPnP action - <fd> <service path> <action> [arguments]
+# Connect an fd (3 or 4; settings also 5 to 9) and send a UPnP action - <fd> <service path> <action> [arguments]
 # No connect timeout: an unreachable speaker blocks until the OS gives up (~75 s)
 send() {
-  local body urn=urn:schemas-upnp-org:service:${2##*/}:1
+  local body n p urn=urn:schemas-upnp-org:service:${2##*/}:1
 
   # Here, so option and argument errors come first
   [[ -n $HOST ]] || error 204
   body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$3 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${4-}</u:$3></s:Body></s:Envelope>"
+  n=${#body}
+  # Content-Length counts bytes; counting characters, pad to a width printf counts in bytes (4 per character at most)
+  ((${#MB} == 2)) || {
+    printf -v p '%-*s' $((n * 4)) "$body"
+    ((n = n * 5 - ${#p}))
+  }
 
   case $1 in
   3) { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
-  *) { exec 4<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
+  4) { exec 4<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
+  *) { eval "exec $1<>\"/dev/tcp/\$HOST/1400\""; } 2>/dev/null ;;
   esac || error 7
-  # Content-Length: bodies are ASCII, or the caller runs in the C locale
   printf 'POST /%s/Control HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\nContent-Type: text/xml; charset="utf-8"\r\nSOAPACTION: "%s#%s"\r\nContent-Length: %d\r\n\r\n%s' \
-    "$2" "$HOST" "$urn" "$3" "${#body}" "$body" >&"$1"
+    "$2" "$HOST" "$urn" "$3" "$n" "$body" >&"$1"
+}
+
+# Print the Sound (vol and mute aside), Home theater, Sub audio and Hardware settings as option=value
+settings() {
+  local i j n=15 out='' p v=()
+  # Option, then the request for its value; speech takes two, its switch (no option) and level
+  local r=(
+    bass "$RC" GetBass ''
+    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
+    loudness "$RC" GetLoudness "$CH"
+    treble "$RC" GetTreble ''
+    trueplay "$RC" GetRoomCalibrationStatus ''
+    height "$RC" GetEQ '<EQType>HeightChannelLevel</EQType>'
+    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
+    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    '' "$RC" GetEQ '<EQType>SpeechEnhanceEnabled</EQType>'
+    speech "$RC" GetEQ '<EQType>DialogLevel</EQType>'
+    level "$RC" GetEQ '<EQType>SubGain</EQType>'
+    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
+    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
+    led "$DP" GetLEDState ''
+    touch "$DP" GetButtonLockState ''
+  )
+
+  # Seven at a time, on fds 3 to 9 (Bash keeps its own above 9): ~95 ms, against ~220 ms one at a time
+  for ((j = 0; j < n + 7; j++)); do
+    if ((j >= 7)); then
+      i=$(((j - 7) * 4))
+      recv $((3 + j % 7)) "${r[i + 2]}"
+      # The reply's first value; RoomCalibrationEnabled comes before Available
+      [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
+      [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
+      v+=("${BASH_REMATCH[1]}")
+    fi
+    ((j >= n)) || send $((3 + j % 7)) "${r[j * 4 + 1]}" "${r[j * 4 + 2]}" "${r[j * 4 + 3]}"
+  done
+
+  # Speech is 0 while off; LED On is 1; the touch controls are on (1) while the buttons aren't locked
+  ((v[8])) || v[9]=0
+  [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0
+  [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0
+  for ((i = 0; i < ${#r[@]}; i += 4)); do
+    [[ -z ${r[i]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
+  done
+  printf %s "$out"
 }
 
 # Send UPnP action and read its reply - <service path> <action> [arguments]
@@ -537,7 +616,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -562,7 +641,7 @@ Sub audio:
   level -15..15 | phase 0..1 | sub 0..1
 
 Hardware:
-  about | led 0..1 | touch 0..1
+  about | led 0..1 | settings | touch 0..1
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
@@ -601,7 +680,7 @@ volume() {
 opt=${1-} arg=${2-}
 
 case $opt in
-'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | stop | tv)
+'' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | settings | stop | tv)
   (($# < 2)) || error 201
   ;;
 esac
@@ -706,6 +785,9 @@ about)
   ;;
 led)
   onoff LEDState Off On "$arg"
+  ;;
+settings)
+  settings
   ;;
 touch)
   # The speaker locks the buttons: touch controls are on while the lock is off

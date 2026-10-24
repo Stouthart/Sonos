@@ -1,4 +1,4 @@
-<!-- 3.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.0**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.1**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ This is **version 3.0**. The [release notes](RELEASE.md) list what each version 
 - **curl** 7.76 or newer, for `soc-curl.sh` only (macOS ships it)
 - A Sonos speaker reachable on your network
 
-Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.1). Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
+Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.1); it also runs on Android in Termux. Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
 
 ## Installation
 
@@ -85,6 +85,8 @@ A bare `seek` prints the position in whole seconds. To move, pass seconds or a `
 
 `now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
 
+On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
+
 `sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
 
 ### Sources
@@ -100,7 +102,7 @@ A bare `seek` prints the position in whole seconds. To move, pass seconds or a `
 
 `favorites` lists the app's **Sonos Favorites**, numbered from 1 in the app's order. `favorites 2` plays the second: a station or track replaces what is playing, and a playlist or album is added to the end of the queue and played from its first track. Some favorites are only shortcuts into the app, such as the Sonos Radio ones Sonos adds itself; they have nothing to play over UPnP and exit `205`. Playing a station or playlist favorite is untested so far, as the test speaker has only shortcuts.
 
-`file` plays one file from an SMB share, given as `//host/share/path` including the file's extension, e.g. `soc.sh file //192.168.1.10/podcasts/episode.mp3`. It replaces what is playing, and `now` shows the source as `file`. The speaker needs read access to the share; a share in its music library works with the login stored there. Characters other than letters, digits and `/._~+-` are percent-encoded, so names with spaces work as they are.
+`file` plays one file from an SMB share, given as `//host/share/path` including the file's extension, e.g. `soc.sh file //192.168.1.10/podcasts/episode.mp3`. It replaces what is playing, and `now` shows the source as `file`. The speaker needs read access to the share; a share in its music library works with the login stored there. Characters other than ASCII letters, digits and `/._~+-` are percent-encoded as UTF-8, so names with spaces or accents work as they are.
 
 `tv` first looks up the speaker's own player ID, which the TV input's address contains, as does the queue's.
 
@@ -157,13 +159,23 @@ A relative `vol` is applied by the speaker, which keeps the result within 0..100
 
 ### Hardware
 
-| Option         | Description                                          |
-| -------------- | ---------------------------------------------------- |
-| `about [key]`  | Show model, room, software, hardware, serial and MAC |
-| `led [0..1]`   | Get or set the status light                          |
-| `touch [0..1]` | Get or set the touch controls                        |
+| Option         | Description                                     |
+| -------------- | ----------------------------------------------- |
+| `about [key]`  | Show model, room, serial, S1 or S2 and versions |
+| `led [0..1]`   | Get or set the status light                     |
+| `settings`     | Show the settings as `option=value`             |
+| `touch [0..1]` | Get or set the touch controls                   |
 
-`about` prints the speaker's details as `key=value`, under the speaker's own field names: `modelName`, `modelNumber`, `roomName`, `displayVersion` (the Sonos software version the app shows), `softwareVersion` (its build), `hardwareVersion`, `serialNum`, `MACAddress` and `apiVersion`. `about <key>` prints one value, and takes any field of the speaker's device description, such as `about memory`; a field the speaker doesn't have prints nothing.
+`about` prints the speaker's details as the app's **About your system** lists them under **Sonos system info**, as `key=value` under the speaker's own field names: `displayName` (the model, as the app names it), `roomName`, `serialNum`, `swGen` (**S1 or S2**: `2` for S2), `softwareVersion` (the app's **Build**) and `hardwareVersion`, then `displayVersion` (the Sonos software version the app shows) and `apiVersion`. The app's IP address is the one in `SONOS_IP`. `about <key>` prints one value, and takes any field of the speaker's device description, such as `about modelName` or `about MACAddress`; a field the speaker doesn't have prints nothing.
+
+`settings` prints the settings of the sections above as `option=value`, in their order: Sound without `vol` and `mute`, then Home theater, Sub audio, `led` and `touch`. Each line is an option and its argument, so a saved copy puts them back:
+
+```bash
+soc.sh settings >~/sonos.cfg
+while IFS== read -r k v; do soc.sh "$k" "$v"; done <~/sonos.cfg
+```
+
+`soc.sh` asks the speaker for the values seven at a time, `soc-curl.sh` one at a time.
 
 `touch` is the app's **Touch controls**: `touch 0` turns the speaker's touch controls off, so touching it does nothing, and `touch 1` turns them back on.
 
@@ -200,6 +212,7 @@ soc.sh seek +30              # skip forward half a minute
 soc.sh seek -1:30            # and back a minute and a half
 
 soc.sh tv                    # switch to the TV
+soc.sh now                   # ... 0:00 / 0:00 - Dolby Atmos (MAT) [tv]
 soc.sh speech                # -> 1
 soc.sh speech 3              # Speech Enhancement, third level
 soc.sh night 1               # Night Sound on
@@ -217,8 +230,9 @@ soc.sh sleep                 # -> 00:44:59
 soc.sh sleep 0               # cancel it
 soc.sh touch 0               # touch controls off
 
-soc.sh about                 # modelName=Sonos Beam Ultra, roomName=..., ...
+soc.sh about                 # displayName=Beam Ultra, roomName=Living Room, ...
 soc.sh about displayVersion  # -> 27.1
+soc.sh settings              # bass=0, limit=100, loudness=0, ...
 ```
 
 Useful shell aliases:
