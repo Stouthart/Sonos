@@ -1,8 +1,19 @@
-<!-- 3.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.1 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.2 is the version distributed; the entries below it show how the scripts got there.
+
+## 3.2 - November 2026
+
+Faster lists, settings and TV readings with the same options, and fuller `artwork` and `now` output. Measured with a Beam Ultra on a Mac.
+
+- **`artwork` always gives a link on your network:** for a cover on the internet, such as Spotify's, it prints the speaker's own copy rather than the HTTPS link, so opening it doesn't leave the network.
+- **`now` names the format more fully:** a track cast from a UPnP app shows its sample rate and bit depth, as in `flac 44.1kHz 16bit`, and the format drops the MIME type's `x-`, as in `flac` for `x-flac`.
+- **`queue` and `favorites` are faster on Bash 4.1 and later:** they split the speaker's list in memory rather than reading it back one byte at a time, about 3.5 ms less for a 30-track queue. On any Bash, a title without an `&` also skips unescaping, about 25 µs less per entry.
+- **`settings` in `soc-curl.sh` takes about 180 ms rather than 250:** one `curl` run sends its requests one after the other, where each request started its own `curl` before. `speech 1..4`, `file`, `favorites <n>` and `queue <n>` save about 6 ms the same way for each request after the first. A refused or failed request still stops the rest, with the same exit code and message as before.
+- **`now` on the TV input is about 10 ms faster in `soc.sh`:** it asks for the TV's sound format alongside what is playing, and ignores that answer for other sources, at no measurable cost.
+- **Every reply is checked a little faster:** a microsecond or two on Bash 5, about 6 on Bash 3.2.
 
 ## 3.1 - October 2026
 

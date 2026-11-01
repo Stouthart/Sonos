@@ -1,6 +1,7 @@
 #!/usr/bin/env -S LC_ALL=C bash
 # C locale: Bash starts ~0.2 ms faster without loading a UTF-8 one
-set -euo pipefail
+# No pathname expansion: nothing needs it, and list splits words
+set -efuo pipefail
 IFS=$'\n\t'
 
 # IPv4 only: /dev/tcp takes ~1 s for a .local name, and the speaker rejects other names
@@ -54,19 +55,32 @@ about() {
   for k in "${keys[@]}"; do
     # The root device's fields precede its embedded devices'
     [[ $REPLY =~ "<$k>"([^<]*)"</$k>" ]] || continue
-    v=${BASH_REMATCH[1]//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${BASH_REMATCH[1]}
+    [[ $v != *'&'* ]] || v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
     v=${v//[[:cntrl:]]/} v=${v//$C1/}
     [[ -n $1 ]] && printf '%s\n' "$v" || printf '%s=%s\n' "$k" "$v"
   done
 }
 
-# Track artwork URL; the player serves relative ones
+# Track artwork URL on the network: relative ones are the player's, and for art elsewhere, as Spotify's on HTTPS, the
+# player serves its own copy by the track's URI
 artwork() {
-  local url
+  local uri url
 
   soap "$AVT" GetPositionInfo
   didl url upnp:albumArtURI
-  [[ -z $url ]] || printf '%s\n' "${url/#\//http://$HOST:1400/}"
+  case $url in
+  '' | http://*) ;;
+  /*) url=http://$HOST:1400$url ;;
+  *)
+    res uri
+    # Unescaped (res keeps one level for SOAP), then percent-encoded, % first
+    uri=${uri//&amp;/\&} uri=${uri//%/%25} uri=${uri//:/%3A} uri=${uri//\//%2F} uri=${uri//\?/%3F}
+    uri=${uri//&/%26} uri=${uri//=/%3D} uri=${uri//+/%2B} uri=${uri//\#/%23} uri=${uri// /%20}
+    [[ -z $uri ]] || url="http://$HOST:1400/getaa?s=1&u=$uri"
+    ;;
+  esac
+  [[ -z $url ]] || printf '%s\n' "$url"
 }
 
 # Request a container's children on fd 3 or 4 - <fd> <object id> [start] [count, 0 for all; default PG]
@@ -80,7 +94,7 @@ dechunk() {
   local b c i=0 n
 
   b=${REPLY#*$'\r\n\r\n'}
-  if [[ ${REPLY:0:${#REPLY}-${#b}} != *[Cc]hunked* ]]; then
+  if [[ ${REPLY:0:${#REPLY}-${#b}} != *hunked* ]]; then
     REPLY=$b
     return
   fi
@@ -115,8 +129,10 @@ didl() {
 
   [[ $REPLY =~ "&lt;$2&gt;"(([^&]|&[^l])*)"&lt;/$2&gt;" ]] && v=${BASH_REMATCH[1]}
   # Escaped twice: DIDL-Lite text inside SOAP; the match stops at &l, so the outer level holds no &lt;
-  v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
-  v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  [[ $v != *'&'* ]] || {
+    v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  }
   v=${v//[[:cntrl:]]/}
   printf -v "$1" %s "${v//$C1/}"
 }
@@ -232,7 +248,11 @@ list() {
       done
       items+=("$t")
     else
-      IFS=$'\x1e' read -r -d '' -a items <<<"${REPLY//"$e"/$'\x1e'}" || :
+      # In memory: read would take a here-string through a pipe, one byte at a time
+      IFS=$'\x1e'
+      # shellcheck disable=SC2206 # split on the separator alone; no pathname expansion (set -f)
+      items=(${REPLY//"$e"/$'\x1e'})
+      IFS=$'\n\t'
     fi
 
     for it in "${items[@]}"; do
@@ -255,15 +275,21 @@ list() {
 now() {
   local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
 
-  soap "$AVT" GetPositionInfo
+  # The TV input format alongside, dropped unread for other sources: no measurable cost, ~10 ms less on TV
+  send 3 "$AVT" GetPositionInfo
+  send 4 "$DP" GetZoneInfo
+  recv 3 GetPositionInfo
   secs pos RelTime
   secs dur TrackDuration
   didl q r:streamInfo
   [[ $q =~ (^|,)bd:([0-9]{1,2})(,|$) ]] && bits=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)sr:([0-9]{4,6})(,|$) ]] && rate=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)l:([01])(,|$) ]] && loss=${BASH_REMATCH[2]}
-  # Files report no stream info, only the format in their MIME type
-  [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]}
+  # Files report no stream info, only the format in their MIME type (x-flac as flac); a cast from a UPnP app
+  # also carries its own rate and bit depth
+  [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]#x-}
+  ((rate == 0)) && [[ $REPLY =~ 'sampleFrequency=&quot;'([0-9]{4,7})'&quot;' ]] && rate=$((10#${BASH_REMATCH[1]}))
+  ((bits == 0)) && [[ $REPLY =~ 'bitsPerSample=&quot;'([0-9]{1,2})'&quot;' ]] && bits=$((10#${BASH_REMATCH[1]}))
 
   # Source: the URI scheme, or for Virtual Line-In the service after the comma
   tag TrackURI
@@ -288,7 +314,7 @@ now() {
   desc ''
   if [[ $src == tv ]]; then
     # The input format's code, by name; an unknown one shows as a number
-    soap "$DP" GetZoneInfo
+    recv 4 GetZoneInfo
     tag HTAudioIn '[0-9]{1,10}'
     c=${BASH_REMATCH[1]}
     tvf='|0=No input connected|2=Stereo|7=Dolby Digital 2.0|18=Dolby Digital 5.1|21=No input|22=No audio'
@@ -299,6 +325,8 @@ now() {
     tvf+='|84934721=DTS 5.1|118489090=Multichannel PCM 7.1|118489146=Dolby Digital Plus 7.1'
     tvf+='|118489148=Dolby TrueHD 7.1'
     [[ $tvf =~ "|$c="([^|]*) ]] && q+=" ${BASH_REMATCH[1]}" || q+=" format $c"
+  else
+    exec 4<&-
   fi
   printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
     "${src:-UNKNOWN}"
@@ -407,11 +435,12 @@ recv() {
   *) eval "exec $1<&-" ;;
   esac
 
-  # As in get; only Browse replies come chunked, but checking costs just ~6 µs
+  # As in get; only Browse replies come chunked, but checking costs just ~2 µs.
+  # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
   ((rc)) || error 202
   if [[ $REPLY == 'HTTP/1.1 200 '* ]]; then
-    [[ ${REPLY:0:256} != *[Cc]hunked* ]] || dechunk
-    [[ $REPLY == *[\<:]"$2"Response[[:space:]/\>]* ]] && return
+    [[ ${REPLY:0:256} != *hunked* ]] || dechunk
+    [[ $REPLY == *:"$2"Response[[:space:]/\>]* || $REPLY == *\<"$2"Response[[:space:]/\>]* ]] && return
   fi
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$2" "${BASH_REMATCH[1]}"
   error 202
@@ -616,7 +645,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.1 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.2 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]

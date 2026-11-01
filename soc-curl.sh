@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Plain shebang, unlike soc.sh: runs on any env, BusyBox's included
-set -euo pipefail
+# No pathname expansion: nothing needs it, and list splits words
+set -efuo pipefail
 IFS=$'\n\t'
 
 BASE=http://${SONOS_IP-}:1400
 # Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
-CURL=(-q -g -s --noproxy '*' -4 -m2 -HUser-Agent: --fail-with-body '-HContent-Type: text/xml; charset="utf-8"')
+# Per transfer; --next resets them
+CURL=(-g --noproxy '*' -4 -m2 -HUser-Agent: --fail-with-body '-HContent-Type: text/xml; charset="utf-8"')
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
@@ -54,19 +56,32 @@ about() {
   for k in "${keys[@]}"; do
     # The root device's fields precede its embedded devices'
     [[ $REPLY =~ "<$k>"([^<]*)"</$k>" ]] || continue
-    v=${BASH_REMATCH[1]//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${BASH_REMATCH[1]}
+    [[ $v != *'&'* ]] || v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
     v=${v//[[:cntrl:]]/} v=${v//$C1/}
     [[ -n $1 ]] && printf '%s\n' "$v" || printf '%s=%s\n' "$k" "$v"
   done
 }
 
-# Track artwork URL; the player serves relative ones
+# Track artwork URL on the network: relative ones are the player's, and for art elsewhere, as Spotify's on HTTPS, the
+# player serves its own copy by the track's URI
 artwork() {
-  local url
+  local uri url
 
   soap "$AVT" GetPositionInfo
   didl url upnp:albumArtURI
-  [[ -z $url ]] || printf '%s\n' "${url/#\//$BASE/}"
+  case $url in
+  '' | http://*) ;;
+  /*) url=$BASE$url ;;
+  *)
+    res uri
+    # Unescaped (res keeps one level for SOAP), then percent-encoded, % first
+    uri=${uri//&amp;/\&} uri=${uri//%/%25} uri=${uri//:/%3A} uri=${uri//\//%2F} uri=${uri//\?/%3F}
+    uri=${uri//&/%26} uri=${uri//=/%3D} uri=${uri//+/%2B} uri=${uri//\#/%23} uri=${uri// /%20}
+    [[ -z $uri ]] || url="$BASE/getaa?s=1&u=$uri"
+    ;;
+  esac
+  [[ -z $url ]] || printf '%s\n' "$url"
 }
 
 # Browse a container's children - <object id> [start] [count, 0 for all; default PG]
@@ -94,8 +109,10 @@ didl() {
 
   [[ $REPLY =~ "&lt;$2&gt;"(([^&]|&[^l])*)"&lt;/$2&gt;" ]] && v=${BASH_REMATCH[1]}
   # Escaped twice: DIDL-Lite text inside SOAP; the match stops at &l, so the outer level holds no &lt;
-  v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
-  v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  [[ $v != *'&'* ]] || {
+    v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+    v=${v//&lt;/<} v=${v//&gt;/>} v=${v//&quot;/\"} v=${v//&apos;/\'} v=${v//&amp;/\&}
+  }
   v=${v//[[:cntrl:]]/}
   printf -v "$1" %s "${v//$C1/}"
 }
@@ -127,8 +144,8 @@ favorites() {
     playqueue "${BASH_REMATCH[1]}"
     ;;
   *)
-    soap "$AVT" SetAVTransportURI "<CurrentURI>$uri</CurrentURI><CurrentURIMetaData>$md</CurrentURIMetaData>"
-    soap "$AVT" Play '<Speed>1</Speed>'
+    soap "$AVT" SetAVTransportURI "<CurrentURI>$uri</CurrentURI><CurrentURIMetaData>$md</CurrentURIMetaData>" \
+      "$AVT" Play '<Speed>1</Speed>'
     ;;
   esac
 }
@@ -165,14 +182,14 @@ file() {
     done
   fi
 
-  soap "$AVT" SetAVTransportURI "<CurrentURI>x-file-cifs://$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
-  soap "$AVT" Play '<Speed>1</Speed>'
+  soap "$AVT" SetAVTransportURI "<CurrentURI>x-file-cifs://$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>" \
+    "$AVT" Play '<Speed>1</Speed>'
 }
 
 # GET a page into REPLY - <path>
 get() {
   [[ -n ${SONOS_IP-} ]] || error 204
-  REPLY=$(LC_ALL=C curl "${CURL[@]}" "$BASE/$1") || error $? "$1"
+  REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" "$BASE/$1") || error $? "$1"
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
@@ -200,7 +217,11 @@ list() {
       done
       items+=("$t")
     else
-      IFS=$'\x1e' read -r -d '' -a items <<<"${REPLY//"$e"/$'\x1e'}" || :
+      # In memory: read would take a here-string through a pipe, one byte at a time
+      IFS=$'\x1e'
+      # shellcheck disable=SC2206 # split on the separator alone; no pathname expansion (set -f)
+      items=(${REPLY//"$e"/$'\x1e'})
+      IFS=$'\n\t'
     fi
 
     for it in "${items[@]}"; do
@@ -229,8 +250,11 @@ now() {
   [[ $q =~ (^|,)bd:([0-9]{1,2})(,|$) ]] && bits=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)sr:([0-9]{4,6})(,|$) ]] && rate=$((10#${BASH_REMATCH[2]}))
   [[ $q =~ (^|,)l:([01])(,|$) ]] && loss=${BASH_REMATCH[2]}
-  # Files report no stream info, only the format in their MIME type
-  [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]}
+  # Files report no stream info, only the format in their MIME type (x-flac as flac); a cast from a UPnP app
+  # also carries its own rate and bit depth
+  [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]#x-}
+  ((rate == 0)) && [[ $REPLY =~ 'sampleFrequency=&quot;'([0-9]{4,7})'&quot;' ]] && rate=$((10#${BASH_REMATCH[1]}))
+  ((bits == 0)) && [[ $REPLY =~ 'bitsPerSample=&quot;'([0-9]{1,2})'&quot;' ]] && bits=$((10#${BASH_REMATCH[1]}))
 
   # Source: the URI scheme, or for Virtual Line-In the service after the comma
   tag TrackURI
@@ -331,18 +355,28 @@ playqueue() {
   if [[ ${BASH_REMATCH[1]} != x-rincon-queue:* ]]; then
     rincon id
     soap "$AVT" SetAVTransportURI \
-      "<CurrentURI>x-rincon-queue:$id#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+      "<CurrentURI>x-rincon-queue:$id#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>" \
+      "$AVT" Seek "<Unit>TRACK_NR</Unit><Target>$1</Target>" "$AVT" Play '<Speed>1</Speed>'
+  else
+    soap "$AVT" Seek "<Unit>TRACK_NR</Unit><Target>$1</Target>" "$AVT" Play '<Speed>1</Speed>'
   fi
-  soap "$AVT" Seek "<Unit>TRACK_NR</Unit><Target>$1</Target>"
-  soap "$AVT" Play '<Speed>1</Speed>'
 }
 
-# Print the reply to a UPnP action; curl replaces the subshell it runs in - <service path> <action> [arguments]
+# Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in -
+# <service path> <action> [arguments] [<service path> <action> <arguments>]...
 post() {
-  local urn=urn:schemas-upnp-org:service:${1##*/}:1
+  local args=() urn
 
-  LC_ALL=C exec curl "${CURL[@]}" "-HSOAPACTION: \"$urn#$2\"" "$BASE/$1/Control" \
-    -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>"
+  while :; do
+    urn=urn:schemas-upnp-org:service:${1##*/}:1
+    ((${#args[@]} == 0)) || args+=(--next)
+    args+=("${CURL[@]}" -w $'\x1e' "-HSOAPACTION: \"$urn#$2\"" "$BASE/$1/Control"
+      -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>")
+    (($# > 3)) || break
+    shift 3
+  done
+  # One process, one request after the other; --fail-early stops at the first failure and keeps its status
+  LC_ALL=C exec curl -q -s --fail-early "${args[@]}"
 }
 
 # List the queue, marking the current track, or play from track n - [n]
@@ -366,7 +400,8 @@ queue() {
 
 # Check REPLY to an action; exits on fault, curl error or foreign reply - <action> [curl status]
 reply() {
-  ((${2-0} == 0)) && [[ $REPLY == *[\<:]"$1"Response[[:space:]/\>]* ]] && return
+  # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
+  ((${2-0} == 0)) && [[ $REPLY == *:"$1"Response[[:space:]/\>]* || $REPLY == *\<"$1"Response[[:space:]/\>]* ]] && return
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$1" "${BASH_REMATCH[1]}"
   ((${2-0} == 0)) || error "$2" "$1"
   error 202
@@ -421,19 +456,30 @@ seek() {
   soap "$AVT" Seek "<Unit>$unit</Unit><Target>$val</Target>"
 }
 
-# Send UPnP action; sets REPLY, exits on fault or foreign reply - <service path> <action> [arguments]
+# Send UPnP actions; sets REPLY to the last reply and REPLIES to the others, exits on fault, curl error or foreign
+# reply - <service path> <action> [arguments] [<service path> <action> <arguments>]...
 soap() {
-  local rc=0
+  local r rc=0
 
   # Here, so option and argument errors come first
   [[ -n ${SONOS_IP-} ]] || error 204
-  REPLY=$(post "$@") || rc=$?
+  r=$(post "$@") || rc=$?
+  REPLIES=()
+  # curl ends each reply with RS and stops at the first failure, so replies followed by another got through
+  while (($# > 3)) && [[ $r == *$'\x1e'?* ]]; do
+    REPLY=${r%%$'\x1e'*}
+    r=${r:${#REPLY}+1}
+    reply "$2"
+    REPLIES+=("$REPLY")
+    shift 3
+  done
+  REPLY=${r%$'\x1e'}
   reply "$2" "$rc"
 }
 
 # Print the Sound (vol and mute aside), Home theater, Sub audio and Hardware settings as option=value
 settings() {
-  local i out='' p v=()
+  local calls=() i out='' p v=()
   # Option, then the request for its value; speech takes two, its switch (no option) and level
   local r=(
     bass "$RC" GetBass ''
@@ -453,9 +499,14 @@ settings() {
     touch "$DP" GetButtonLockState ''
   )
 
-  # One at a time, as in speech
+  # One curl, one request after the other: ~175 ms, against ~255 ms with a curl each
   for ((i = 0; i < ${#r[@]}; i += 4)); do
-    soap "${r[i + 1]}" "${r[i + 2]}" "${r[i + 3]}"
+    calls+=("${r[i + 1]}" "${r[i + 2]}" "${r[i + 3]}")
+  done
+  soap "${calls[@]}"
+  REPLIES+=("$REPLY")
+  for ((i = 0; i < ${#r[@]}; i += 4)); do
+    REPLY=${REPLIES[i / 4]}
     # The reply's first value; RoomCalibrationEnabled comes before Available
     [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
     [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
@@ -490,8 +541,11 @@ speech() {
     fi
   elif [[ $1 =~ ^[0-4]$ ]]; then
     # Level 0 is accepted but ignored; off is a separate switch
-    soap "$RC" SetEQ "$se<DesiredValue>$(($1 > 0))</DesiredValue>"
-    (($1 == 0)) || soap "$RC" SetEQ "$dl<DesiredValue>$1</DesiredValue>"
+    if (($1)); then
+      soap "$RC" SetEQ "$se<DesiredValue>1</DesiredValue>" "$RC" SetEQ "$dl<DesiredValue>$1</DesiredValue>"
+    else
+      soap "$RC" SetEQ "$se<DesiredValue>0</DesiredValue>"
+    fi
   else
     error 201
   fi
@@ -543,7 +597,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.1 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.2 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]

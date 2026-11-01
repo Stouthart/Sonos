@@ -1,4 +1,4 @@
-<!-- 3.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.1**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.2**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -81,9 +81,9 @@ Options that only act (`play`, `vol 40`) print nothing; the exit code tells you 
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds or a `min:sec` position (`seek 219` and `seek 3:39` are the same jump), either with an optional `+` or `-`. Both forms top out at `3599` and `59:59`, and the seconds in `min:sec` are always two digits. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
 
-`artwork` prints the URL of the current track's artwork, either the streaming service's own link or an image the speaker serves itself. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
+`artwork` prints a URL on your network for the current track's artwork: the music library's own link, or an image the speaker serves itself. That includes its copy of a streaming service's cover, such as Spotify's, so opening it doesn't reach the internet. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
 
 On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
 
@@ -175,7 +175,7 @@ soc.sh settings >~/sonos.cfg
 while IFS== read -r k v; do soc.sh "$k" "$v"; done <~/sonos.cfg
 ```
 
-`soc.sh` asks the speaker for the values seven at a time, `soc-curl.sh` one at a time.
+`soc.sh` asks the speaker for the values seven at a time, `soc-curl.sh` one at a time, all in one `curl` run.
 
 `touch` is the app's **Touch controls**: `touch 0` turns the speaker's touch controls off, so touching it does nothing, and `touch 1` turns them back on.
 
@@ -192,7 +192,7 @@ soc.sh now
 # Massive Attack / Teardrop [Mezzanine]
 # 1:44 / 5:29 - lossless 44.1kHz 16bit [spotify]
 
-soc.sh artwork               # https://i.scdn.co/image/ab67616d...
+soc.sh artwork               # http://192.168.1.42:1400/getaa?s=1&u=x-sonos-spotify%3A...
 soc.sh pause                 # pause, or resume when paused
 soc.sh next                  # next track
 soc.sh file //192.168.1.10/podcasts/episode.mp3   # play a file from a share
@@ -276,7 +276,7 @@ Pass `--xdbg` as the very first argument to trace execution with per-line timing
 
 ### Device quirks
 
-- **Spotify Connect** runs through the speaker's Virtual Line-In. Skipping and seeking work, but the speaker accepts shuffle and repeat changes and then ignores them: set those in Spotify. Seeking while paused resumes playback.
+- **Spotify Connect** runs through the speaker's Virtual Line-In. Skipping and seeking work, but the speaker accepts shuffle and repeat changes and then ignores them: set those in Spotify. Seeking while paused resumes playback. While paused, the speaker reports no track at all, so `now` shows `UNKNOWN` and `artwork` prints nothing until it plays again.
 - **No bit rate:** the speaker reports sample rate, bit depth and whether a stream is lossless, but no bit rate.
 - **Speech Enhancement level 0** is accepted but ignored by the speaker, which is why `speech 0` uses the separate switch.
 - **Sub level** is stored as sent, even far outside the app's -15..15, so `level` checks the range before sending.
