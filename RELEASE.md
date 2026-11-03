@@ -1,8 +1,18 @@
-<!-- 3.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.3 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.2 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.3 is the version distributed; the entries below it show how the scripts got there.
+
+## 3.3 - November 2026
+
+Groups: with the speaker in a group, playback and the queue now reach the group's leader, and `vol` and `mute` every room, with the same options. Measured with a Beam Ultra grouped with an Era 300.
+
+- **Playback and the queue go to the group's leader:** a group member refuses Pause, accepts Play and ignores it, and reports neither the group's track nor its queue, so `pause` said `Pause not available for the current source.` and `now` printed `0:00 / 0:00 [rincon]`. A playback or queue option now asks the speaker first whether it leads, one small request, about 20 ms, and goes to the leader if it doesn't. `now` asks only once the speaker turns out to be a member, so it costs nothing on a speaker alone. Other sound and hardware settings, and `tv`, stay with the speaker itself.
+- **`vol` and `mute` set the whole group:** they set only the speaker `SONOS_IP` names, so a group's rooms drifted apart. Now every room gets the same level, unlike the Sonos app, which keeps the rooms' shares. A relative `vol` steps the speaker and the other rooms take its new level, so `vol +0` brings a group back to one level. Read, they print the speaker's own. The group's rooms are asked with the change itself, so a speaker alone takes about as long as before.
+- **`now` names line-in and radio:** both showed `stream`; they're now `line-in` and `radio`, the latter also for MP3, HLS and AAC radio streams.
+- **`artwork` stays on your network:** a cover on the internet over plain HTTP, such as a radio station's logo, now comes as the speaker's copy too, and a cover the speaker has no copy of prints nothing rather than the outside link. The track's address is percent-encoded in full, tabs and non-ASCII characters included.
+- **Sturdier replies:** `soc.sh` finds a chunked reply by its header in any case and anywhere among the headers, takes chunk extensions, and refuses chunks that don't end as they should, at the same speed. It also refuses a reply whose body isn't as long as its `Content-Length` says, and reads the reply's verdict from its body alone, so a header can't pass for it. Both scripts refuse a reply over 16 MiB on any Bash and curl, and send a write only once the one before it took: `speech` sets the level only once the switch took. Group members are found by their attributes in any order.
 
 ## 3.2 - November 2026
 

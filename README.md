@@ -1,4 +1,4 @@
-<!-- 3.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.3 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.2**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.3**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ This is **version 3.2**. The [release notes](RELEASE.md) list what each version 
 - **curl** 7.76 or newer, for `soc-curl.sh` only (macOS ships it)
 - A Sonos speaker reachable on your network
 
-Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.1); it also runs on Android in Termux. Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
+Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.3), also grouped with an Era 300; it also runs on Android in Termux. Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
 
 ## Installation
 
@@ -81,9 +81,9 @@ Options that only act (`play`, `vol 40`) print nothing; the exit code tells you 
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds or a `min:sec` position (`seek 219` and `seek 3:39` are the same jump), either with an optional `+` or `-`. Both forms top out at `3599` and `59:59`, and the seconds in `min:sec` are always two digits. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
 
-`artwork` prints a URL on your network for the current track's artwork: the music library's own link, or an image the speaker serves itself. That includes its copy of a streaming service's cover, such as Spotify's, so opening it doesn't reach the internet. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
+`artwork` prints a URL on your network for the current track's artwork: the music library's own link, a UPnP server's at a private address, or an image the speaker serves itself. That includes its copy of any cover on the internet, such as Spotify's or a radio station's logo, so opening it doesn't reach the internet; when the speaker has no copy to give, `artwork` prints nothing rather than the outside link. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, and reads `UNKNOWN` when there is none.
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, with `line-in` and `radio` by name, and reads `UNKNOWN` when there is none.
 
 On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
 
@@ -231,7 +231,7 @@ soc.sh sleep 0               # cancel it
 soc.sh touch 0               # touch controls off
 
 soc.sh about                 # displayName=Beam Ultra, roomName=Living Room, ...
-soc.sh about displayVersion  # -> 27.1
+soc.sh about displayVersion  # -> 27.3
 soc.sh settings              # bass=0, limit=100, loudness=0, ...
 ```
 
@@ -273,10 +273,18 @@ Pass `--xdbg` as the very first argument to trace execution with per-line timing
 - The UPnP actions are Sonos's own and unofficial. They may change with a software update.
 - Requests are plain HTTP on the local network, without authentication. Anything on the same network can control the speaker.
 - Text from the speaker is stripped of control characters, C1 controls included, before it is printed, so it pastes cleanly into a terminal or a pipe.
+- Replies are read as HTTP has them: `soc.sh` takes chunked replies whatever the header's case or place, refuses one whose chunks aren't framed right or whose body isn't as long as its `Content-Length` says, and reads the reply's verdict from its body alone. Both scripts refuse a reply over 16 MiB on any Bash and curl, send a write only once the one before it took, and find group members by their attributes, in any order.
+
+### Groups
+
+In a group, playback and the queue go to the group's leader, whichever speaker `SONOS_IP` names. A member refuses Pause, accepts Play and ignores it, and reports neither the group's track nor its queue, so before its first request a playback or queue option asks the speaker whether it leads: one small request more, about 20 ms. `now` asks only once the speaker turns out to be a member.
+
+`vol` and `mute` set every room of the group to the same level, unlike the Sonos app, which keeps the rooms' shares. A relative `vol` steps the speaker `SONOS_IP` names, and the other rooms take its new level, so `vol +0` brings a group back to one level. Read, they print the speaker's own. A bonded Sub or surrounds aren't rooms: they follow their main speaker. The group's rooms are asked with the change itself, alongside it in `soc.sh` and in the same curl in `soc-curl.sh`, so a speaker alone takes about as long as before. Other sound and hardware settings, and `tv`, stay with the speaker itself.
 
 ### Device quirks
 
 - **Spotify Connect** runs through the speaker's Virtual Line-In. Skipping and seeking work, but the speaker accepts shuffle and repeat changes and then ignores them: set those in Spotify. Seeking while paused resumes playback. While paused, the speaker reports no track at all, so `now` shows `UNKNOWN` and `artwork` prints nothing until it plays again.
+- **The TV in a group:** the soundbar leads any group that plays its TV, so `now` reads the TV's format from the leader. Handing the lead to another room ends the TV: that room leads with nothing loaded, and `now` shows `UNKNOWN`. Tested with a Beam Ultra and an Era 300.
 - **No bit rate:** the speaker reports sample rate, bit depth and whether a stream is lossless, but no bit rate.
 - **Speech Enhancement level 0** is accepted but ignored by the speaker, which is why `speech 0` uses the separate switch.
 - **Sub level** is stored as sent, even far outside the app's -15..15, so `level` checks the range before sending.

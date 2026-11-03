@@ -6,9 +6,13 @@ IFS=$'\n\t'
 
 # IPv4 only: /dev/tcp takes ~1 s for a .local name, and the speaker rejects other names
 HOST=${SONOS_IP-}
-# read -N (Bash 4.1+) is 2.5x faster than -d ''; older Bash splits long lists slowly, so reads pages
-RD=(-d '') PG=100
-((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || RD=(-N 16777216) PG=0
+# 1: the option plays or queues, which in a group only its leader does, so the first request finds that one first; 2:
+# found, or not needed
+LEADER=0
+# A reply over 16 MiB is refused. read -N (Bash 4.1+) is 2.5x faster than -d '' and stops at that cap; older Bash
+# splits long lists slowly, so reads pages, and its reply's length is checked after reading
+MAX=16777216 RD=(-d '') PG=100
+((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || RD=(-N "$MAX") PG=0
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
@@ -16,6 +20,12 @@ AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties
 C1=$'\xc2[\x80-\x9f]'
 # A 2-byte character: its length shows whether Bash counts bytes (C locale) or characters (UTF-8; Android always)
 MB=$'\xc3\xa9'
+# Chunked transfer, by its header in any case and wherever it sits; a chunk's size line, with any extension after ;
+TE=$'\r\n[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]:[^\r]*[Cc][Hh][Uu][Nn][Kk][Ee][Dd]'
+CS=$'^([[:xdigit:]]{1,8})(;[^\r]*)?\r\n'
+CN=$'^\r\n([[:xdigit:]]{1,8})(;[^\r]*)?\r\n' # From the second on: led by the chunk before's CRLF
+# Otherwise the body's length, by its header in any case
+CL=$'\r\n[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[ \t]*([0-9]{1,8})[ \t]*\r\n'
 
 [[ ${1-} == --xdbg ]] && {
   shift
@@ -69,17 +79,19 @@ artwork() {
 
   soap "$AVT" GetPositionInfo
   didl url upnp:albumArtURI
-  case $url in
-  '' | http://*) ;;
-  /*) url=http://$HOST:1400$url ;;
-  *)
+  if [[ $url == /* ]]; then
+    url=http://$HOST:1400$url
+  elif [[ -n $url ]] && ! lan "$url"; then
+    # Elsewhere, as Spotify's on HTTPS or a station's logo on the internet: the speaker's copy by the track's URI,
+    # unescaped once (res keeps one level for SOAP), or none when there's no URI to ask by
     res uri
-    # Unescaped (res keeps one level for SOAP), then percent-encoded, % first
-    uri=${uri//&amp;/\&} uri=${uri//%/%25} uri=${uri//:/%3A} uri=${uri//\//%2F} uri=${uri//\?/%3F}
-    uri=${uri//&/%26} uri=${uri//=/%3D} uri=${uri//+/%2B} uri=${uri//\#/%23} uri=${uri// /%20}
-    [[ -z $uri ]] || url="http://$HOST:1400/getaa?s=1&u=$uri"
-    ;;
-  esac
+    url=''
+    [[ -z $uri ]] || {
+      uri=${uri//&amp;/\&} # Unquoted: quoted, Bash 3.2 keeps the \; bare, from Bash 5.2 & stands for the match
+      pct uri "$uri" '0-9A-Za-z._~-'
+      url="http://$HOST:1400/getaa?s=1&u=$uri"
+    }
+  fi
   [[ -z $url ]] || printf '%s\n' "$url"
 }
 
@@ -89,25 +101,39 @@ browse() {
     "<ObjectID>$2</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>${3-0}</StartingIndex><RequestedCount>${4-$PG}</RequestedCount><SortCriteria></SortCriteria>"
 }
 
-# Set REPLY to its body, joined if chunked: <hex size> CRLF <data> CRLF, up to size 0; sizes count bytes
+# Set REPLY to its body, joined if chunked: <hex size> CRLF <data> CRLF, up to size 0 and the CRLF that closes the
+# reply; else as long as its Content-Length says, if it has one. Sizes count bytes
 dechunk() {
-  local b c i=0 n
+  local b c h i=0 n p re=$CS
 
   b=${REPLY#*$'\r\n\r\n'}
-  if [[ ${REPLY:0:${#REPLY}-${#b}} != *hunked* ]]; then
+  h=${REPLY:0:${#REPLY}-${#b}}
+  if [[ ! $h =~ $TE ]]; then
     REPLY=$b
+    [[ $h =~ $CL ]] || return 0
+    n=${#b}
+    # Counting characters: as send does, pad to a width printf counts in bytes
+    ((${#MB} == 2)) || {
+      printf -v p '%-*s' $((n * 4)) "$b"
+      ((n = n * 5 - ${#p}))
+    }
+    ((n == 10#${BASH_REMATCH[1]})) || error 202
     return
   fi
-  # By offset: cutting each chunk off the front copies the rest every time
+  # By offset: cutting each chunk off the front copies the rest every time. A chunk's closing CRLF is matched with
+  # the next size line, as each ${b:…} measures all of b: one more per chunk costs ~20% on a long queue
   REPLY=''
-  while [[ ${b:i:10} =~ ^([[:xdigit:]]{1,8})$'\r\n' ]] && ((n = 16#${BASH_REMATCH[1]})); do
+  while [[ ${b:i:82} =~ $re ]] && ((n = 16#${BASH_REMATCH[1]})); do
     c=${b:i+${#BASH_REMATCH[0]}:n}
     # Counting characters, that took n of them: printf's precision cuts n bytes, and ${#c} counts them as ${b:…} does
     ((${#MB} == 2)) || printf -v c '%.*s' "$n" "$c"
     REPLY+=$c
-    ((i += ${#BASH_REMATCH[0]} + ${#c} + 2))
+    ((i += ${#BASH_REMATCH[0]} + ${#c}))
+    re=$CN
   done
-  [[ ${b:i:3} == 0$'\r\n' ]] || error 202
+  # The last chunk has size 0, and a CRLF closes the reply (Sonos sends no trailers); a chunk not ended by CRLF, or
+  # anything else, is corrupt
+  [[ ${b:i:82} =~ $re && $((16#${BASH_REMATCH[1]})) == 0 && ${b:i+${#BASH_REMATCH[0]}} == $'\r\n' ]] || error 202
 }
 
 # Print prefix, then "artist / title [album]" of REPLY's DIDL-Lite (radio: stream content as title) - <prefix>
@@ -174,38 +200,27 @@ favorites() {
 
 # Play a file from an SMB share the speaker can read - <//host/share/path>
 file() {
-  local LC_ALL=C b c i k n uri=${1#//}
+  local uri
 
   [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
-  # Percent-encode bytes outside the unreserved set, if any; spelled out, as Android's [[:alnum:]] takes é
-  if [[ $uri == *[^0-9A-Za-z/._~+-]* ]]; then
-    uri=''
-    for ((i = 2; i < ${#1}; i++)); do
-      c=${1:i:1}
-      case $c in
-      [0-9A-Za-z/._~+-]) uri+=$c ;;
-      *)
-        # Bash 3.2 sign-extends bytes above 0x7F
-        printf -v n %d "'$c"
-        printf -v b %.1s "$c"
-        if [[ $b == "$c" ]]; then
-          printf -v c %%%02X $((n & 255))
-        else
-          # A character, as Android's Bash takes one in every locale: its UTF-8 bytes from the code point
-          ((k = 1 + (n > 2047) + (n > 65535)))
-          printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
-          while ((k--)); do
-            printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
-          done
-        fi
-        uri+=$c
-        ;;
-      esac
-    done
-  fi
+  # The path's slashes and + stay
+  pct uri "${1#//}" '0-9A-Za-z/._~+-'
 
   soap "$AVT" SetAVTransportURI "<CurrentURI>x-file-cifs://$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
   soap "$AVT" Play '<Speed>1</Speed>'
+}
+
+# Point HOST at the leader that REPLY's x-rincon URI names, as a group member's does: it refuses Pause (UPnP error 701),
+# ignores Play, and reports neither the group's track nor its queue. 1 if REPLY names none
+follow() {
+  local id loc
+
+  [[ $REPLY =~ '>x-rincon:'(RINCON_[[:alnum:]]{1,32})'</' ]] || return 1
+  id=${BASH_REMATCH[1]}
+  soap ZoneGroupTopology GetZoneGroupState
+  member loc Location UUID "$id&quot;" || error 202
+  [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+  HOST=${BASH_REMATCH[1]}
 }
 
 # GET a page into REPLY, its chunks joined - <path>
@@ -218,14 +233,26 @@ get() {
   IFS= read -r "${RD[@]}" REPLY <&3 || rc=$?
   exec 3<&-
 
-  # read succeeds only at its cap (-N) or a NUL byte (-d ''), both cutting the page short
-  ((rc)) && [[ $REPLY == 'HTTP/1.1 200 '* ]] || error 202
+  # read succeeds only at its cap (-N) or a NUL byte (-d ''), both cutting the page short; -d '' has no cap of its own
+  ((rc && ${#REPLY} < MAX)) && [[ $REPLY == 'HTTP/1.1 200 '* ]] || error 202
   dechunk
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
 isnum() {
   [[ $1 =~ ^([+-]?)(0|[1-9][0-9]{0,3})$ && ${BASH_REMATCH[2]} -le $2 ]]
+}
+
+# An http URL on the local network, at a private, link-local or loopback IPv4 address: as a UPnP server's cover - <url>
+lan() {
+  [[ $1 =~ ^http://((10|127)\.[0-9]{1,3}|192\.168|169\.254|172\.(1[6-9]|2[0-9]|3[01]))(\.[0-9]{1,3}){2}(:[0-9]{1,5})?(/|$) ]]
+}
+
+# Play and queue on the group's leader: one small request alone, another for a group member - before send connects
+leader() {
+  LEADER=2
+  soap "$AVT" GetMediaInfo
+  follow || :
 }
 
 # Print a container's items as "n) artist / title [album]", "> " marking item cur if its res is uri;
@@ -271,6 +298,33 @@ list() {
   done
 }
 
+# An attribute of the topology member in REPLY whose attribute by starts with value, escaped as the reply has it, so
+# value can end in &quot; to match whole; attributes in any order - <var> <attribute> <by> <value>
+member() {
+  local m rest=$REPLY
+
+  while [[ $rest == *'&lt;ZoneGroupMember '* ]]; do
+    rest=${rest#*'&lt;ZoneGroupMember '}
+    # Up to the tag's end: a value's own > comes escaped twice
+    m=" ${rest%%'&gt;'*}"
+    [[ $m == *" $3=&quot;$4"* && $m =~ ' '"$2"'=&quot;'([^&]*)'&quot;' ]] || continue
+    printf -v "$1" %s "${BASH_REMATCH[1]}"
+    return 0
+  done
+  return 1
+}
+
+# Get or set mute; in a group, on every room - [0..1]
+mute() {
+  if [[ -z $1 ]]; then
+    value Mute "$CH" 0 1 ''
+  elif [[ $1 =~ ^[01]$ ]]; then
+    together SetMute DesiredMute "$1"
+  else
+    error 201
+  fi
+}
+
 # Print "artist / title [album]", then position, duration, quality (TV: input format) and source
 now() {
   local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
@@ -279,6 +333,13 @@ now() {
   send 3 "$AVT" GetPositionInfo
   send 4 "$DP" GetZoneInfo
   recv 3 GetPositionInfo
+  # A group member names its leader in place of a track: that one tells. No request more for a speaker alone
+  if ((LEADER == 0)) && follow; then
+    LEADER=2
+    exec 4<&-
+    now
+    return
+  fi
   secs pos RelTime
   secs dur TrackDuration
   didl q r:streamInfo
@@ -291,13 +352,17 @@ now() {
   ((rate == 0)) && [[ $REPLY =~ 'sampleFrequency=&quot;'([0-9]{4,7})'&quot;' ]] && rate=$((10#${BASH_REMATCH[1]}))
   ((bits == 0)) && [[ $REPLY =~ 'bitsPerSample=&quot;'([0-9]{1,2})'&quot;' ]] && bits=$((10#${BASH_REMATCH[1]}))
 
-  # Source: the URI scheme, or for Virtual Line-In the service after the comma
+  # Source: the URI scheme, or for Virtual Line-In the service after the comma; line-in and radio by name, as both
+  # stream, and a group member's own as group
   tag TrackURI
   src=${BASH_REMATCH[1]%%:*}
   case $src in
   x-file-cifs) src='file' ;;
   x-sonos-htastream) src=tv ;;
   x-sonos-vli) src=${BASH_REMATCH[1]#*,} src=${src%%:*} ;;
+  x-rincon) src=group ;;
+  x-rincon-stream) src=line-in ;;
+  aac | hls-radio | x-rincon-mp3radio | x-sonosapi-hls | x-sonosapi-radio | x-sonosapi-stream) src=radio ;;
   *) src=${src#x-} src=${src#sonos-} src=${src#sonosapi-} src=${src#rincon-} ;;
   esac
   src=${src//[^[:alnum:]._-]/}
@@ -345,6 +410,41 @@ onoff() {
   else
     error 201
   fi
+}
+
+# Percent-encode text outside the kept characters, given as a bracket expression's inside: bytes, or a character's
+# UTF-8 bytes, as Android's Bash takes characters in every locale; spelled out, as Android's [[:alnum:]] takes é
+# - <var> <text> <kept>
+pct() {
+  local LC_ALL=C b c i k n out=''
+
+  if [[ $2 != *[^$3]* ]]; then
+    printf -v "$1" %s "$2"
+    return
+  fi
+  for ((i = 0; i < ${#2}; i++)); do
+    c=${2:i:1}
+    case $c in
+    [$3]) out+=$c ;;
+    *)
+      # Bash 3.2 sign-extends bytes above 0x7F
+      printf -v n %d "'$c"
+      printf -v b %.1s "$c"
+      if [[ $b == "$c" ]]; then
+        printf -v c %%%02X $((n & 255))
+      else
+        # A character: its UTF-8 bytes from the code point
+        ((k = 1 + (n > 2047) + (n > 65535)))
+        printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
+        while ((k--)); do
+          printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
+        done
+      fi
+      out+=$c
+      ;;
+    esac
+  done
+  printf -v "$1" %s "$out"
 }
 
 # Get or set repeat (0 off, 1 one, 2 all) or shuffle - <0 repeat | 1 shuffle> [arg]
@@ -426,7 +526,7 @@ queue() {
 
 # Read an fd to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
 recv() {
-  local rc=0
+  local ok=0 rc=0
 
   IFS= read -r "${RD[@]}" REPLY <&"$1" || rc=$?
   case $1 in
@@ -435,13 +535,12 @@ recv() {
   *) eval "exec $1<&-" ;;
   esac
 
-  # As in get; only Browse replies come chunked, but checking costs just ~2 µs.
+  # As in get, then the body alone, so a header can't pass for the reply or its fault.
   # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
-  ((rc)) || error 202
-  if [[ $REPLY == 'HTTP/1.1 200 '* ]]; then
-    [[ ${REPLY:0:256} != *hunked* ]] || dechunk
-    [[ $REPLY == *:"$2"Response[[:space:]/\>]* || $REPLY == *\<"$2"Response[[:space:]/\>]* ]] && return
-  fi
+  ((rc && ${#REPLY} < MAX)) || error 202
+  [[ $REPLY != 'HTTP/1.1 200 '* ]] || ok=1
+  dechunk
+  ((ok)) && [[ $REPLY == *:"$2"Response[[:space:]/\>]* || $REPLY == *\<"$2"Response[[:space:]/\>]* ]] && return
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$2" "${BASH_REMATCH[1]}"
   error 202
 }
@@ -458,8 +557,11 @@ res() {
 
 # This player's id, found by HOST in REPLY's topology - <var>
 rincon() {
-  [[ $REPLY =~ 'UUID=&quot;'(RINCON_[[:alnum:]]{1,32})'&quot; Location=&quot;http://'"$HOST"':1400/' ]] || error 202
-  printf -v "$1" %s "${BASH_REMATCH[1]}"
+  local r # Not id: the caller's own, which printf -v sets
+
+  member r UUID Location "http://$HOST:1400/" || error 202
+  [[ $r =~ ^RINCON_[[:alnum:]]{1,32}$ ]] || error 202
+  printf -v "$1" %s "$r"
 }
 
 # H:MM:SS element of REPLY as seconds, 0 if absent - <var> <element>
@@ -501,6 +603,7 @@ send() {
 
   # Here, so option and argument errors come first
   [[ -n $HOST ]] || error 204
+  ((LEADER != 1)) || leader
   body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$3 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${4-}</u:$3></s:Body></s:Envelope>"
   n=${#body}
   # Content-Length counts bytes; counting characters, pad to a width printf counts in bytes (4 per character at most)
@@ -569,7 +672,7 @@ soap() {
   recv 3 "$2"
 }
 
-# Get or set speech enhancement (0 off, 1..4 level), both values at once - [arg]
+# Get or set speech enhancement (0 off, 1..4 level), both values read at once - [arg]
 speech() {
   local dl='<EQType>DialogLevel</EQType>' se='<EQType>SpeechEnhanceEnabled</EQType>'
 
@@ -588,11 +691,10 @@ speech() {
       printf '0\n'
     fi
   elif [[ $1 =~ ^[0-4]$ ]]; then
-    # Level 0 is accepted but ignored; off is a separate switch
-    send 3 "$RC" SetEQ "$se<DesiredValue>$(($1 > 0))</DesiredValue>"
-    (($1 == 0)) || send 4 "$RC" SetEQ "$dl<DesiredValue>$1</DesiredValue>"
-    recv 3 SetEQ
-    (($1 == 0)) || recv 4 SetEQ
+    # Level 0 is accepted but ignored; off is a separate switch. Written one after the other: the level only once the
+    # switch took, as in soc-curl.sh
+    soap "$RC" SetEQ "$se<DesiredValue>$(($1 > 0))</DesiredValue>"
+    (($1 == 0)) || soap "$RC" SetEQ "$dl<DesiredValue>$1</DesiredValue>"
   else
     error 201
   fi
@@ -617,6 +719,43 @@ timer() {
   else
     error 201
   fi
+}
+
+# Set the volume or mute, and in a group every room's to the speaker's new one, as one level. The group's rooms are
+# asked alongside, so a speaker alone doesn't wait longer; a bonded Sub or surround isn't a room: it follows its main
+# speaker. The speaker gets its value again with the others: none is skipped by address - <action> <element> <value>
+together() {
+  local HOST=$HOST e=$2 hosts=() id ids j loc n to=$3
+
+  send 3 "$RC" "$1" "$CH<$2>$3</$2>"
+  send 4 ZoneGroupTopology GetZoneGroupAttributes
+  recv 3 "$1"
+  # A relative step: the others take where the speaker ended
+  [[ $1 != SetRelativeVolume ]] || {
+    tag NewVolume '[0-9]{1,3}'
+    to=${BASH_REMATCH[1]} e=DesiredVolume
+  }
+  recv 4 GetZoneGroupAttributes
+  tag CurrentZonePlayerUUIDsInGroup '[[:alnum:]_,]*'
+  ids=${BASH_REMATCH[1]},
+  [[ $ids == *,?* ]] || return 0
+
+  soap ZoneGroupTopology GetZoneGroupState
+  while [[ $ids == RINCON_* ]]; do
+    id=${ids%%,*} ids=${ids#*,}
+    member loc Location UUID "$id&quot;" || error 202
+    [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+    hosts+=("${BASH_REMATCH[1]}")
+  done
+  # Seven at a time, on fds 3 to 9, as settings
+  n=${#hosts[@]}
+  for ((j = 0; j < n + 7; j++)); do
+    ((j < 7)) || recv $((3 + j % 7)) "Set${e#Desired}"
+    ((j >= n)) || {
+      HOST=${hosts[j]}
+      send $((3 + j % 7)) "$RC" "Set${e#Desired}" "$CH<$e>$to</$e>"
+    }
+  done
 }
 
 # Get or set Trueplay tuning - [0..1]
@@ -645,7 +784,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.2 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.3 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -676,6 +815,8 @@ Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
 About accepts a key (e.g. about modelName).
+In a group, playback and the queue go to its leader; vol and mute
+set every room to the same level.
 Requires SONOS_IP: the speaker's IPv4 address."
 }
 
@@ -695,13 +836,17 @@ value() {
   fi
 }
 
-# Get, set or adjust (±) volume - [arg]
+# Get, set or adjust (±) volume; in a group, every room's - [arg]
 volume() {
-  if isnum "$1" 100 && [[ -n ${BASH_REMATCH[1]} ]]; then
+  if [[ -z $1 ]]; then
+    value Volume "$CH" 0 100 ''
+  elif ! isnum "$1" 100; then
+    error 201
+  elif [[ -n ${BASH_REMATCH[1]} ]]; then
     # The speaker clamps to 0..100
-    soap "$RC" SetRelativeVolume "$CH<Adjustment>${BASH_REMATCH[0]#+}</Adjustment>"
+    together SetRelativeVolume Adjustment "${BASH_REMATCH[0]#+}"
   else
-    value Volume "$CH" 0 100 "$1"
+    together SetVolume DesiredVolume "$1"
   fi
 }
 
@@ -711,6 +856,17 @@ opt=${1-} arg=${2-}
 case $opt in
 '' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | settings | stop | tv)
   (($# < 2)) || error 201
+  ;;
+esac
+
+# Playback and the queue on the group's leader; sound, hardware and the TV on the speaker itself, and now asks the
+# leader only once it knows there is one
+case $opt in
+artwork | clear | file | next | pause | play | playqueue | prev | previous | queue | repeat | seek | shuffle | sleep | stop)
+  LEADER=1
+  ;;
+favorites | favourites | favs)
+  [[ -z $arg ]] || LEADER=1 # Listed from any player: the household's
   ;;
 esac
 
@@ -783,7 +939,7 @@ loudness)
   value Loudness "$CH" 0 1 "$arg"
   ;;
 mute)
-  value Mute "$CH" 0 1 "$arg"
+  mute "$arg"
   ;;
 night)
   value EQ NightMode 0 1 "$arg"

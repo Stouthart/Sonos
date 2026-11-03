@@ -5,11 +5,17 @@ set -efuo pipefail
 IFS=$'\n\t'
 
 BASE=http://${SONOS_IP-}:1400
+# 1: the option plays or queues, which in a group only its leader does, so the first request finds that one first; 2:
+# found, or not needed
+LEADER=0
 # Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
-# Per transfer; --next resets them
-CURL=(-g --noproxy '*' -4 -m2 -HUser-Agent: --fail-with-body '-HContent-Type: text/xml; charset="utf-8"')
+# Per transfer; --next resets them. A reply over 16 MiB is refused, as soc.sh's read cap does; before curl 8.4,
+# --max-filesize can't stop one of unknown length, as Browse's chunked replies, so get and reply check what came
+MAX=16777216
+CURL=(-g --noproxy '*' -4 -m2 --max-filesize "$MAX" -HUser-Agent: --fail-with-body
+  '-HContent-Type: text/xml; charset="utf-8"')
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
@@ -32,7 +38,7 @@ error() {
   22) msg="Server error on ${2-request}." ;;
   200) msg='Missing or invalid option.' ;;
   201) msg='Missing or invalid argument.' ;;
-  202) msg='Invalid response from Sonos.' ;;
+  202 | 63) msg='Invalid response from Sonos.' ;; # 63: over the reply cap
   203) [[ $3 == 701 ]] && msg="$2 not available for the current source." || msg="Sonos refused $2, UPnP error $3." ;;
   204) msg="Set SONOS_IP to the speaker's IP address or .local name." ;;
   205) msg="Favorite $2 is a shortcut; play it from the Sonos app." ;;
@@ -70,17 +76,19 @@ artwork() {
 
   soap "$AVT" GetPositionInfo
   didl url upnp:albumArtURI
-  case $url in
-  '' | http://*) ;;
-  /*) url=$BASE$url ;;
-  *)
+  if [[ $url == /* ]]; then
+    url=$BASE$url
+  elif [[ -n $url ]] && ! lan "$url"; then
+    # Elsewhere, as Spotify's on HTTPS or a station's logo on the internet: the speaker's copy by the track's URI,
+    # unescaped once (res keeps one level for SOAP), or none when there's no URI to ask by
     res uri
-    # Unescaped (res keeps one level for SOAP), then percent-encoded, % first
-    uri=${uri//&amp;/\&} uri=${uri//%/%25} uri=${uri//:/%3A} uri=${uri//\//%2F} uri=${uri//\?/%3F}
-    uri=${uri//&/%26} uri=${uri//=/%3D} uri=${uri//+/%2B} uri=${uri//\#/%23} uri=${uri// /%20}
-    [[ -z $uri ]] || url="$BASE/getaa?s=1&u=$uri"
-    ;;
-  esac
+    url=''
+    [[ -z $uri ]] || {
+      uri=${uri//&amp;/\&} # Unquoted: quoted, Bash 3.2 keeps the \; bare, from Bash 5.2 & stands for the match
+      pct uri "$uri" '0-9A-Za-z._~-'
+      url="$BASE/getaa?s=1&u=$uri"
+    }
+  fi
   [[ -z $url ]] || printf '%s\n' "$url"
 }
 
@@ -152,49 +160,51 @@ favorites() {
 
 # Play a file from an SMB share the speaker can read - <//host/share/path>
 file() {
-  local LC_ALL=C b c i k n uri=${1#//}
+  local uri
 
   [[ $1 =~ ^//[^/]+/[^/]+/.*[^/]$ ]] || error 201
-  # Percent-encode bytes outside the unreserved set, if any; spelled out, as Android's [[:alnum:]] takes é
-  if [[ $uri == *[^0-9A-Za-z/._~+-]* ]]; then
-    uri=''
-    for ((i = 2; i < ${#1}; i++)); do
-      c=${1:i:1}
-      case $c in
-      [0-9A-Za-z/._~+-]) uri+=$c ;;
-      *)
-        # Bash 3.2 sign-extends bytes above 0x7F
-        printf -v n %d "'$c"
-        printf -v b %.1s "$c"
-        if [[ $b == "$c" ]]; then
-          printf -v c %%%02X $((n & 255))
-        else
-          # A character, as Android's Bash takes one in every locale: its UTF-8 bytes from the code point
-          ((k = 1 + (n > 2047) + (n > 65535)))
-          printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
-          while ((k--)); do
-            printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
-          done
-        fi
-        uri+=$c
-        ;;
-      esac
-    done
-  fi
+  # The path's slashes and + stay
+  pct uri "${1#//}" '0-9A-Za-z/._~+-'
 
   soap "$AVT" SetAVTransportURI "<CurrentURI>x-file-cifs://$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>" \
     "$AVT" Play '<Speed>1</Speed>'
+}
+
+# Point BASE at the leader that REPLY's x-rincon URI names, as a group member's does: it refuses Pause (UPnP error 701),
+# ignores Play, and reports neither the group's track nor its queue. 1 if REPLY names none
+follow() {
+  local id loc
+
+  [[ $REPLY =~ '>x-rincon:'(RINCON_[[:alnum:]]{1,32})'</' ]] || return 1
+  id=${BASH_REMATCH[1]}
+  soap ZoneGroupTopology GetZoneGroupState
+  member loc Location UUID "$id&quot;" || error 202
+  [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+  BASE=http://${BASH_REMATCH[1]}:1400
 }
 
 # GET a page into REPLY - <path>
 get() {
   [[ -n ${SONOS_IP-} ]] || error 204
   REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" "$BASE/$1") || error $? "$1"
+  ((${#REPLY} <= MAX)) || error 63
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
 isnum() {
   [[ $1 =~ ^([+-]?)(0|[1-9][0-9]{0,3})$ && ${BASH_REMATCH[2]} -le $2 ]]
+}
+
+# An http URL on the local network, at a private, link-local or loopback IPv4 address: as a UPnP server's cover - <url>
+lan() {
+  [[ $1 =~ ^http://((10|127)\.[0-9]{1,3}|192\.168|169\.254|172\.(1[6-9]|2[0-9]|3[01]))(\.[0-9]{1,3}){2}(:[0-9]{1,5})?(/|$) ]]
+}
+
+# Play and queue on the group's leader: one small request alone, another for a group member - before soap posts
+leader() {
+  LEADER=2
+  soap "$AVT" GetMediaInfo
+  follow || :
 }
 
 # Print a container's items as "n) artist / title [album]", "> " marking item cur if its res is uri;
@@ -239,11 +249,44 @@ list() {
   done
 }
 
+# An attribute of the topology member in REPLY whose attribute by starts with value, escaped as the reply has it, so
+# value can end in &quot; to match whole; attributes in any order - <var> <attribute> <by> <value>
+member() {
+  local m rest=$REPLY
+
+  while [[ $rest == *'&lt;ZoneGroupMember '* ]]; do
+    rest=${rest#*'&lt;ZoneGroupMember '}
+    # Up to the tag's end: a value's own > comes escaped twice
+    m=" ${rest%%'&gt;'*}"
+    [[ $m == *" $3=&quot;$4"* && $m =~ ' '"$2"'=&quot;'([^&]*)'&quot;' ]] || continue
+    printf -v "$1" %s "${BASH_REMATCH[1]}"
+    return 0
+  done
+  return 1
+}
+
+# Get or set mute; in a group, on every room - [0..1]
+mute() {
+  if [[ -z $1 ]]; then
+    value Mute "$CH" 0 1 ''
+  elif [[ $1 =~ ^[01]$ ]]; then
+    together SetMute DesiredMute "$1"
+  else
+    error 201
+  fi
+}
+
 # Print "artist / title [album]", then position, duration, quality (TV: input format) and source
 now() {
   local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
 
   soap "$AVT" GetPositionInfo
+  # A group member names its leader in place of a track: that one tells. No request more for a speaker alone
+  if ((LEADER == 0)) && follow; then
+    LEADER=2
+    now
+    return
+  fi
   secs pos RelTime
   secs dur TrackDuration
   didl q r:streamInfo
@@ -256,13 +299,17 @@ now() {
   ((rate == 0)) && [[ $REPLY =~ 'sampleFrequency=&quot;'([0-9]{4,7})'&quot;' ]] && rate=$((10#${BASH_REMATCH[1]}))
   ((bits == 0)) && [[ $REPLY =~ 'bitsPerSample=&quot;'([0-9]{1,2})'&quot;' ]] && bits=$((10#${BASH_REMATCH[1]}))
 
-  # Source: the URI scheme, or for Virtual Line-In the service after the comma
+  # Source: the URI scheme, or for Virtual Line-In the service after the comma; line-in and radio by name, as both
+  # stream, and a group member's own as group
   tag TrackURI
   src=${BASH_REMATCH[1]%%:*}
   case $src in
   x-file-cifs) src='file' ;;
   x-sonos-htastream) src=tv ;;
   x-sonos-vli) src=${BASH_REMATCH[1]#*,} src=${src%%:*} ;;
+  x-rincon) src=group ;;
+  x-rincon-stream) src=line-in ;;
+  aac | hls-radio | x-rincon-mp3radio | x-sonosapi-hls | x-sonosapi-radio | x-sonosapi-stream) src=radio ;;
   *) src=${src#x-} src=${src#sonos-} src=${src#sonosapi-} src=${src#rincon-} ;;
   esac
   src=${src//[^[:alnum:]._-]/}
@@ -308,6 +355,41 @@ onoff() {
   else
     error 201
   fi
+}
+
+# Percent-encode text outside the kept characters, given as a bracket expression's inside: bytes, or a character's
+# UTF-8 bytes, as Android's Bash takes characters in every locale; spelled out, as Android's [[:alnum:]] takes é
+# - <var> <text> <kept>
+pct() {
+  local LC_ALL=C b c i k n out=''
+
+  if [[ $2 != *[^$3]* ]]; then
+    printf -v "$1" %s "$2"
+    return
+  fi
+  for ((i = 0; i < ${#2}; i++)); do
+    c=${2:i:1}
+    case $c in
+    [$3]) out+=$c ;;
+    *)
+      # Bash 3.2 sign-extends bytes above 0x7F
+      printf -v n %d "'$c"
+      printf -v b %.1s "$c"
+      if [[ $b == "$c" ]]; then
+        printf -v c %%%02X $((n & 255))
+      else
+        # A character: its UTF-8 bytes from the code point
+        ((k = 1 + (n > 2047) + (n > 65535)))
+        printf -v c %%%02X $((256 - (128 >> k) | n >> 6 * k))
+        while ((k--)); do
+          printf -v c %s%%%02X "$c" $((128 | n >> 6 * k & 63))
+        done
+      fi
+      out+=$c
+      ;;
+    esac
+  done
+  printf -v "$1" %s "$out"
 }
 
 # Get or set repeat (0 off, 1 one, 2 all) or shuffle - <0 repeat | 1 shuffle> [arg]
@@ -362,20 +444,24 @@ playqueue() {
   fi
 }
 
-# Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in -
-# <service path> <action> [arguments] [<service path> <action> <arguments>]...
+# Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in. A service path may
+# name another speaker, as http://<address>:1400/<path> - <service path> <action> [arguments] [<service path> <action>
+# <arguments>]...
 post() {
-  local args=() urn
+  local args=() u urn
 
   while :; do
     urn=urn:schemas-upnp-org:service:${1##*/}:1
+    u=$1
+    [[ $u == http://* ]] || u=$BASE/$1
     ((${#args[@]} == 0)) || args+=(--next)
-    args+=("${CURL[@]}" -w $'\x1e' "-HSOAPACTION: \"$urn#$2\"" "$BASE/$1/Control"
+    args+=("${CURL[@]}" -w $'\x1e' "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
       -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>")
     (($# > 3)) || break
     shift 3
   done
-  # One process, one request after the other; --fail-early stops at the first failure and keeps its status
+  # One process, one request after the other; --fail-early stops at the first failure and keeps its status. Sonos
+  # refuses an action with HTTP 500, so the ones after it aren't sent; a 200 is the action done
   LC_ALL=C exec curl -q -s --fail-early "${args[@]}"
 }
 
@@ -400,6 +486,7 @@ queue() {
 
 # Check REPLY to an action; exits on fault, curl error or foreign reply - <action> [curl status]
 reply() {
+  ((${#REPLY} <= MAX)) || error 63
   # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
   ((${2-0} == 0)) && [[ $REPLY == *:"$1"Response[[:space:]/\>]* || $REPLY == *\<"$1"Response[[:space:]/\>]* ]] && return
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$1" "${BASH_REMATCH[1]}"
@@ -463,6 +550,7 @@ soap() {
 
   # Here, so option and argument errors come first
   [[ -n ${SONOS_IP-} ]] || error 204
+  ((LEADER != 1)) || leader
   r=$(post "$@") || rc=$?
   REPLIES=()
   # curl ends each reply with RS and stops at the first failure, so replies followed by another got through
@@ -572,6 +660,34 @@ timer() {
   fi
 }
 
+# Set the volume or mute, and in a group every room's to the speaker's new one, as one level. The group's rooms are
+# asked in the same curl, one request more; a bonded Sub or surround isn't a room: it follows its main speaker. The
+# speaker gets its value again with the others: none is skipped by address - <action> <element> <value>
+together() {
+  local calls=() e=$2 id ids loc to=$3
+
+  soap "$RC" "$1" "$CH<$2>$3</$2>" ZoneGroupTopology GetZoneGroupAttributes
+  tag CurrentZonePlayerUUIDsInGroup '[[:alnum:]_,]*'
+  ids=${BASH_REMATCH[1]},
+  [[ $ids == *,?* ]] || return 0
+  # A relative step: the others take where the speaker ended
+  [[ $1 != SetRelativeVolume ]] || {
+    REPLY=${REPLIES[0]}
+    tag NewVolume '[0-9]{1,3}'
+    to=${BASH_REMATCH[1]} e=DesiredVolume
+  }
+
+  soap ZoneGroupTopology GetZoneGroupState
+  while [[ $ids == RINCON_* ]]; do
+    id=${ids%%,*} ids=${ids#*,}
+    member loc Location UUID "$id&quot;" || error 202
+    [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+    calls+=("http://${BASH_REMATCH[1]}:1400/$RC" "Set${e#Desired}" "$CH<$e>$to</$e>")
+  done
+  # One curl, one room after the other
+  soap "${calls[@]}"
+}
+
 # Get or set Trueplay tuning - [0..1]
 trueplay() {
   if [[ -z $1 ]]; then
@@ -597,7 +713,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.2 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.3 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -628,6 +744,8 @@ Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
 About accepts a key (e.g. about modelName).
+In a group, playback and the queue go to its leader; vol and mute
+set every room to the same level.
 Requires SONOS_IP: the speaker's IP address or .local name."
 }
 
@@ -647,13 +765,17 @@ value() {
   fi
 }
 
-# Get, set or adjust (±) volume - [arg]
+# Get, set or adjust (±) volume; in a group, every room's - [arg]
 volume() {
-  if isnum "$1" 100 && [[ -n ${BASH_REMATCH[1]} ]]; then
+  if [[ -z $1 ]]; then
+    value Volume "$CH" 0 100 ''
+  elif ! isnum "$1" 100; then
+    error 201
+  elif [[ -n ${BASH_REMATCH[1]} ]]; then
     # The speaker clamps to 0..100
-    soap "$RC" SetRelativeVolume "$CH<Adjustment>${BASH_REMATCH[0]#+}</Adjustment>"
+    together SetRelativeVolume Adjustment "${BASH_REMATCH[0]#+}"
   else
-    value Volume "$CH" 0 100 "$1"
+    together SetVolume DesiredVolume "$1"
   fi
 }
 
@@ -663,6 +785,17 @@ opt=${1-} arg=${2-}
 case $opt in
 '' | -h | --help | help | artwork | clear | next | now | pause | play | prev | previous | rescan | settings | stop | tv)
   (($# < 2)) || error 201
+  ;;
+esac
+
+# Playback and the queue on the group's leader; sound, hardware and the TV on the speaker itself, and now asks the
+# leader only once it knows there is one
+case $opt in
+artwork | clear | file | next | pause | play | playqueue | prev | previous | queue | repeat | seek | shuffle | sleep | stop)
+  LEADER=1
+  ;;
+favorites | favourites | favs)
+  [[ -z $arg ]] || LEADER=1 # Listed from any player: the household's
   ;;
 esac
 
@@ -735,7 +868,7 @@ loudness)
   value Loudness "$CH" 0 1 "$arg"
   ;;
 mute)
-  value Mute "$CH" 0 1 "$arg"
+  mute "$arg"
   ;;
 night)
   value EQ NightMode 0 1 "$arg"
