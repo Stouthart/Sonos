@@ -102,21 +102,23 @@ browse() {
 }
 
 # Set REPLY to its body, joined if chunked: <hex size> CRLF <data> CRLF, up to size 0 and the CRLF that closes the
-# reply; else as long as its Content-Length says, if it has one. Sizes count bytes
+# reply; else as long as its Content-Length says, if it has one. Sizes count bytes, and so does the cap: Bash on
+# Android counts characters, as does any Bash in UTF-8 started as bash soc.sh, past the shebang's C locale
 dechunk() {
-  local b c h i=0 n p re=$CS
+  local b c h i=0 n p re=$CS total=0
 
   b=${REPLY#*$'\r\n\r\n'}
   h=${REPLY:0:${#REPLY}-${#b}}
   if [[ ! $h =~ $TE ]]; then
     REPLY=$b
-    [[ $h =~ $CL ]] || return 0
     n=${#b}
-    # Counting characters: as send does, pad to a width printf counts in bytes
+    # Counting characters: as send does, pad to a width printf counts in bytes. Not ((n = …)): 0 would end the script
     ((${#MB} == 2)) || {
       printf -v p '%-*s' $((n * 4)) "$b"
-      ((n = n * 5 - ${#p}))
+      n=$((n * 5 - ${#p}))
     }
+    ((n <= MAX)) || error 202
+    [[ $h =~ $CL ]] || return 0
     ((n == 10#${BASH_REMATCH[1]})) || error 202
     return
   fi
@@ -124,6 +126,7 @@ dechunk() {
   # the next size line, as each ${b:…} measures all of b: one more per chunk costs ~20% on a long queue
   REPLY=''
   while [[ ${b:i:82} =~ $re ]] && ((n = 16#${BASH_REMATCH[1]})); do
+    ((total += n, total <= MAX)) || error 202
     c=${b:i+${#BASH_REMATCH[0]}:n}
     # Counting characters, that took n of them: printf's precision cuts n bytes, and ${#c} counts them as ${b:…} does
     ((${#MB} == 2)) || printf -v c '%.*s' "$n" "$c"
@@ -524,7 +527,8 @@ queue() {
   list Q:0 "$cur" "$uri"
 }
 
-# Read an fd to EOF into REPLY; exits on fault or foreign reply - <fd> <action>
+# Read an fd to EOF into REPLY; exits on fault or foreign reply, or with [soft] set returns 1 on a fault, its errorCode
+# in BASH_REMATCH[1] - <fd> <action> [soft]
 recv() {
   local ok=0 rc=0
 
@@ -541,7 +545,10 @@ recv() {
   [[ $REPLY != 'HTTP/1.1 200 '* ]] || ok=1
   dechunk
   ((ok)) && [[ $REPLY == *:"$2"Response[[:space:]/\>]* || $REPLY == *\<"$2"Response[[:space:]/\>]* ]] && return
-  [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$2" "${BASH_REMATCH[1]}"
+  if [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
+    [[ -z ${3-} ]] || return 1
+    error 203 "$2" "${BASH_REMATCH[1]}"
+  fi
   error 202
 }
 
@@ -621,48 +628,64 @@ send() {
     "$2" "$HOST" "$urn" "$3" "$n" "$body" >&"$1"
 }
 
-# Print the Sound (vol and mute aside), Home theater, Sub audio and Hardware settings as option=value
+# Print the settings as option=value in the Sonos app's order: Sound (vol and mute aside), Sub audio, Home theater and
+# Hardware. One the speaker hasn't got is left out, as Home theater on an Era 300, and Sub audio without a bonded Sub
 settings() {
-  local i j n=15 out='' p v=()
+  local cms fault='' hts i j n=15 out='' p v=()
   # Option, then the request for its value; speech takes two, its switch (no option) and level
   local r=(
-    bass "$RC" GetBass ''
-    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
-    loudness "$RC" GetLoudness "$CH"
-    treble "$RC" GetTreble ''
     trueplay "$RC" GetRoomCalibrationStatus ''
+    bass "$RC" GetBass ''
+    treble "$RC" GetTreble ''
     height "$RC" GetEQ '<EQType>HeightChannelLevel</EQType>'
-    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
-    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    loudness "$RC" GetLoudness "$CH"
+    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
+    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
+    sublevel "$RC" GetEQ '<EQType>SubGain</EQType>'
+    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
     '' "$RC" GetEQ '<EQType>SpeechEnhanceEnabled</EQType>'
     speech "$RC" GetEQ '<EQType>DialogLevel</EQType>'
-    level "$RC" GetEQ '<EQType>SubGain</EQType>'
-    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
-    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
-    led "$DP" GetLEDState ''
+    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
+    light "$DP" GetLEDState ''
     touch "$DP" GetButtonLockState ''
   )
 
-  # Seven at a time, on fds 3 to 9 (Bash keeps its own above 9): ~95 ms, against ~220 ms one at a time
+  # Seven at a time, on fds 3 to 9 (Bash keeps its own above 9): ~95 ms, against ~220 ms one at a time. A refusal is a
+  # setting the speaker hasn't got: no value
   for ((j = 0; j < n + 7; j++)); do
     if ((j >= 7)); then
       i=$(((j - 7) * 4))
-      recv $((3 + j % 7)) "${r[i + 2]}"
-      # The reply's first value; RoomCalibrationEnabled comes before Available
-      [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
-      [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
-      v+=("${BASH_REMATCH[1]}")
+      if recv $((3 + j % 7)) "${r[i + 2]}" soft; then
+        # The reply's first value; RoomCalibrationEnabled comes before Available
+        [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
+        [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
+        v+=("${BASH_REMATCH[1]}")
+      else
+        [[ -n $fault ]] || fault="${r[i + 2]} ${BASH_REMATCH[1]}"
+        v+=('')
+      fi
     fi
     ((j >= n)) || send $((3 + j % 7)) "${r[j * 4 + 1]}" "${r[j * 4 + 2]}" "${r[j * 4 + 3]}"
   done
 
-  # Speech is 0 while off; LED On is 1; the touch controls are on (1) while the buttons aren't locked
-  ((v[8])) || v[9]=0
-  [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0
-  [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0
+  # A speaker answers the Sub's settings without one: its channel map tells, with a Sub on SW, as
+  # RINCON_A:LF,RF;RINCON_B:SW (a soundbar's HTSatChanMapSet, a speaker's ChannelMapSet)
+  if [[ -n ${v[6]} ]]; then
+    soap ZoneGroupTopology GetZoneGroupState
+    member hts HTSatChanMapSet Location "http://$HOST:1400/" || hts=''
+    member cms ChannelMapSet Location "http://$HOST:1400/" || cms=''
+    [[ $hts$cms == *[:,]SW* ]] || v[6]='' v[7]='' v[8]=''
+  fi
+  # Speech is 0 while off; the light On is 1; the touch controls are on (1) while the buttons aren't locked
+  [[ -z ${v[9]} ]] || ((v[9])) || v[10]=0
+  [[ -z ${v[13]} ]] || { [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0; }
+  [[ -z ${v[14]} ]] || { [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0; }
   for ((i = 0; i < ${#r[@]}; i += 4)); do
-    [[ -z ${r[i]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
+    [[ -z ${r[i]} || -z ${v[i / 4]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
   done
+  # Nothing at all is no speaker's settings: the first refusal, as the option itself would report it
+  [[ -n $out ]] || error 203 "${fault% *}" "${fault#* }"
   printf %s "$out"
 }
 
@@ -784,7 +807,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.3 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.4 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -799,22 +822,21 @@ Sources:
   clear | queue 1..n | rescan
 
 Sound:
-  bass -10..10 | limit 1..100 | loudness 0..1 | mute 0..1
-  treble -10..10 | trueplay 0..1 | vol 0..100
-
-Home theater:
-  height -10..10 | lipsync 0..5 | night 0..1 | speech 0..4
+  bass -10..10 | height -10..10 | limit 1..100 | loudness 0..1
+  mute 0..1 | treble -10..10 | trueplay 0..1 | vol 0..100
 
 Sub audio:
-  level -15..15 | phase 0..1 | sub 0..1
+  phase 0..1 | sub 0..1 | sublevel -15..15
+
+Home theater:
+  lipsync 0..5 | night 0..1 | speech 0..4
 
 Hardware:
-  about | led 0..1 | settings | touch 0..1
+  about | light 0..1 | settings | touch 0..1
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
-About accepts a key (e.g. about modelName).
 In a group, playback and the queue go to its leader; vol and mute
 set every room to the same level.
 Requires SONOS_IP: the speaker's IPv4 address."
@@ -932,20 +954,11 @@ height)
 limit)
   value EQ VolumeScalingFactor 1 100 "$arg"
   ;;
-lipsync)
-  value EQ AudioDelay 0 5 "$arg"
-  ;;
 loudness)
   value Loudness "$CH" 0 1 "$arg"
   ;;
 mute)
   mute "$arg"
-  ;;
-night)
-  value EQ NightMode 0 1 "$arg"
-  ;;
-speech)
-  speech "$arg"
   ;;
 treble)
   value Treble '' -10 10 "$arg"
@@ -956,19 +969,28 @@ trueplay)
 vol | volume)
   volume "$arg"
   ;;
-level)
-  value EQ SubGain -15 15 "$arg"
-  ;;
 phase)
   value EQ SubPolarity 0 1 "$arg"
   ;;
 sub)
   value EQ SubEnable 0 1 "$arg"
   ;;
+sublevel)
+  value EQ SubGain -15 15 "$arg"
+  ;;
+lipsync)
+  value EQ AudioDelay 0 5 "$arg"
+  ;;
+night)
+  value EQ NightMode 0 1 "$arg"
+  ;;
+speech)
+  speech "$arg"
+  ;;
 about)
   about "$arg"
   ;;
-led)
+light)
   onoff LEDState Off On "$arg"
   ;;
 settings)

@@ -1,8 +1,19 @@
-<!-- 3.3 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.4 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.3 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.4 is the version distributed; the entries below it show how the scripts got there.
+
+## 3.4 - November 2026
+
+`settings` follows the Sonos app: the app's order, and only the settings the speaker has, so it now works on a speaker without Home theater. The usage screen follows the app's sections, and two options take the app's names. Measured with a Beam Ultra with a Sub Mini, and an Era 300.
+
+- **`settings` works on any speaker:** it stopped at the first setting the speaker refused, so on an Era 300, which has no Home theater, it printed only `Sonos refused GetEQ, UPnP error 402.` and exited `203`. It now leaves out what the speaker refuses, and fails only when it refuses every setting.
+- **Sub audio only with a bonded Sub:** a speaker answers for the Sub's settings without one, as an Era 300 does, so `settings` printed them for a speaker with no Sub. It now reads the topology too, and prints them only when the speaker's channel map has a Sub. That is one request more in `soc.sh`, about 7 ms, and two in `soc-curl.sh`, in the same `curl` run, about 20 ms.
+- **In the app's order:** `trueplay`, `bass`, `treble`, `height`, `loudness` and `limit`, then `sub`, `sublevel` and `phase`, then `speech`, `night` and `lipsync`, and last `light` and `touch`.
+- **Renamed after the app:** `level` is now `sublevel`, for the app's **Sub level**, and `led` is now `light`, for its **Status light**. The old names are gone, so a copy of `settings` saved with 3.3 needs those two lines renamed before it puts the settings back.
+- **The usage screen follows the app's sections:** `height` moves to Sound, as the app has it under EQ, and Sub audio comes before Home theater. The line on `about <key>` left the usage screen for the README.
+- **The 16 MiB cap counts bytes everywhere:** where Bash counts characters, as on Android, `soc.sh` measured a reply in characters, so one full of accented or other non-ASCII text could get past the cap at up to four times its size.
 
 ## 3.3 - November 2026
 

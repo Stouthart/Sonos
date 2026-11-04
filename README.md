@@ -1,4 +1,4 @@
-<!-- 3.3 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.4 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.3**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.4**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ This is **version 3.3**. The [release notes](RELEASE.md) list what each version 
 - **curl** 7.76 or newer, for `soc-curl.sh` only (macOS ships it)
 - A Sonos speaker reachable on your network
 
-Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.3), also grouped with an Era 300; it also runs on Android in Termux. Other Sonos speakers should work; `tv`, `height`, `lipsync`, `night` and `speech` need a soundbar that has those settings, and `level`, `phase` and `sub` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
+Developed and tested on macOS with a **Sonos Beam Ultra** (Sonos software 27.3), also grouped with an Era 300; it also runs on Android in Termux. Other Sonos speakers should work; `tv`, `lipsync`, `night` and `speech` need a soundbar that has those settings, `height` a speaker with height channels, and `phase`, `sub` and `sublevel` a bonded Sub (tested with a Sub Mini). Linux and Windows (Git Bash, WSL) should work but are untested.
 
 ## Installation
 
@@ -55,7 +55,7 @@ Add that line to your `~/.zshrc` or `~/.bashrc` to make it permanent. The Sonos 
 soc.sh <option> [argument]
 ```
 
-Options print the current value when called without an argument. Only `seek` and `vol` accept a **relative** value prefixed with `+` or `-`; for `bass`, `treble`, `height` and `level` a minus sign is part of the value. Write numbers without leading zeros: `vol 8`, not `vol 08`.
+Options print the current value when called without an argument. Only `seek` and `vol` accept a **relative** value prefixed with `+` or `-`; for `bass`, `treble`, `height` and `sublevel` a minus sign is part of the value. Write numbers without leading zeros: `vol 8`, not `vol 08`.
 
 Options that only act (`play`, `vol 40`) print nothing; the exit code tells you whether they worked. An option that takes no argument rejects one, so `stop now` fails rather than stopping. Arguments are checked before anything is sent.
 
@@ -117,6 +117,7 @@ The queue is numbered from 1, and the current track is marked with a leading `>`
 | Option             | Description                             |
 | ------------------ | --------------------------------------- |
 | `bass [-10..10]`   | Get or set bass                         |
+| `height [-10..10]` | Get or set the height channel level     |
 | `limit [1..100]`   | Get or set the volume limit, in percent |
 | `loudness [0..1]`  | Get or set loudness                     |
 | `mute [0..1]`      | Get or set mute                         |
@@ -124,22 +125,31 @@ The queue is numbered from 1, and the current track is marked with a leading `>`
 | `trueplay [0..1]`  | Get or set Trueplay tuning              |
 | `vol [0..100]`     | Get or set volume (alias: `volume`)     |
 
+`height` is the app's **Height level**, under its EQ: the height channel level for immersive audio formats, on a speaker that has height channels.
+
 `limit` is the app's **Volume limit**, in percent. The speaker scales the volume to it rather than capping it: `vol` still runs from 0 to 100, but plays quieter.
 
 `trueplay` is the app's **Trueplay tuning** switch: `trueplay 0` turns the room's tuning off, `trueplay 1` back on. Tuning or retuning the room needs the app. While Trueplay is off, the app also shows the Sub's Phase control (`phase`).
 
 A relative `vol` is applied by the speaker, which keeps the result within 0..100.
 
+### Sub audio
+
+| Option               | Description                                |
+| -------------------- | ------------------------------------------ |
+| `phase [0..1]`       | Get or set Phase control: 0 = 0°, 1 = 180° |
+| `sub [0..1]`         | Get or set Sonos Sub: 0 off, 1 on          |
+| `sublevel [-15..15]` | Get or set the Sub level                   |
+
+`phase` is the app's **Phase control**, which the app shows only while Trueplay tuning is off (`trueplay 0`): `phase 1` inverts the Sub's phase (180°), `phase 0` sets it back (0°). `sub` is the app's **Sonos Sub** switch: `sub 0` turns the Sub off and leaves its level alone. `sublevel` is the app's **Sub level**, from `-15` to `15`. All three need a Sub bonded to the speaker.
+
 ### Home theater
 
-| Option             | Description                                      |
-| ------------------ | ------------------------------------------------ |
-| `height [-10..10]` | Get or set the height channel level              |
-| `lipsync [0..5]`   | Get or set TV dialog sync: 0 off, 1..5 delay     |
-| `night [0..1]`     | Get or set Night Sound                           |
-| `speech [0..4]`    | Get or set Speech Enhancement: 0 off, 1..4 level |
-
-`height` is the app's **Height level**, the height channel level for immersive audio formats.
+| Option           | Description                                      |
+| ---------------- | ------------------------------------------------ |
+| `lipsync [0..5]` | Get or set TV dialog sync: 0 off, 1..5 delay     |
+| `night [0..1]`   | Get or set Night Sound                           |
+| `speech [0..4]`  | Get or set Speech Enhancement: 0 off, 1..4 level |
 
 `lipsync` is the app's **TV dialog sync**, also listed as **Audio delay (lip sync)**: it delays the sound from the TV, from `0` (none) to `5` (most), to match a picture that lags behind it. The speaker refuses other values.
 
@@ -147,35 +157,27 @@ A relative `vol` is applied by the speaker, which keeps the result within 0..100
 
 `speech` is the app's **Speech Enhancement**, where 1..4 are its four levels, from low to max. The speaker keeps the on/off switch and the level as separate settings: a bare `speech` reads both in one go and prints the level, or `0` when it is off. `speech 0` turns the switch off and leaves the level alone.
 
-### Sub audio
-
-| Option            | Description                                |
-| ----------------- | ------------------------------------------ |
-| `level [-15..15]` | Get or set the Sub level                   |
-| `phase [0..1]`    | Get or set Phase control: 0 = 0°, 1 = 180° |
-| `sub [0..1]`      | Get or set Sonos Sub: 0 off, 1 on          |
-
-`level` is the app's **Sub level**, from `-15` to `15`. `phase` is the app's **Phase control**, which the app shows only while Trueplay tuning is off (`trueplay 0`): `phase 1` inverts the Sub's phase (180°), `phase 0` sets it back (0°). `sub` is the app's **Sonos Sub** switch: `sub 0` turns the Sub off and leaves its level alone. All three need a Sub bonded to the speaker.
-
 ### Hardware
 
 | Option         | Description                                     |
 | -------------- | ----------------------------------------------- |
 | `about [key]`  | Show model, room, serial, S1 or S2 and versions |
-| `led [0..1]`   | Get or set the status light                     |
+| `light [0..1]` | Get or set the status light                     |
 | `settings`     | Show the settings as `option=value`             |
 | `touch [0..1]` | Get or set the touch controls                   |
 
 `about` prints the speaker's details as the app's **About your system** lists them under **Sonos system info**, as `key=value` under the speaker's own field names: `displayName` (the model, as the app names it), `roomName`, `serialNum`, `swGen` (**S1 or S2**: `2` for S2), `softwareVersion` (the app's **Build**) and `hardwareVersion`, then `displayVersion` (the Sonos software version the app shows) and `apiVersion`. The app's IP address is the one in `SONOS_IP`. `about <key>` prints one value, and takes any field of the speaker's device description, such as `about modelName` or `about MACAddress`; a field the speaker doesn't have prints nothing.
 
-`settings` prints the settings of the sections above as `option=value`, in their order: Sound without `vol` and `mute`, then Home theater, Sub audio, `led` and `touch`. Each line is an option and its argument, so a saved copy puts them back:
+`light` is the app's **Status light**: `light 0` turns the speaker's light off, `light 1` back on.
+
+`settings` prints the settings of the sections above as `option=value`, in the order of the app's room settings: `trueplay`, `bass`, `treble`, `height`, `loudness`, `limit`, then Sub audio as `sub`, `sublevel` and `phase`, Home theater as `speech`, `night` and `lipsync`, and last `light` and `touch`. A setting the speaker hasn't got is left out, such as Home theater on a speaker that isn't a soundbar, and Sub audio without a bonded Sub. Each line is an option and its argument, so a saved copy puts them back:
 
 ```bash
 soc.sh settings >~/sonos.cfg
 while IFS== read -r k v; do soc.sh "$k" "$v"; done <~/sonos.cfg
 ```
 
-`soc.sh` asks the speaker for the values seven at a time, `soc-curl.sh` one at a time, all in one `curl` run.
+`soc.sh` asks the speaker for the values seven at a time, `soc-curl.sh` one at a time, all in one `curl` run. With Sub settings, both then read the topology for whether a Sub is bonded.
 
 `touch` is the app's **Touch controls**: `touch 0` turns the speaker's touch controls off, so touching it does nothing, and `touch 1` turns them back on.
 
@@ -220,8 +222,8 @@ soc.sh height -2             # a little less height
 soc.sh lipsync 2             # delay the TV's sound a little
 soc.sh trueplay 0            # Trueplay tuning off
 
-soc.sh level                 # -> -2
-soc.sh level 3               # a little more Sub
+soc.sh sublevel              # -> -2
+soc.sh sublevel 3            # a little more Sub
 soc.sh phase 1               # Sub phase 180°
 soc.sh sub 0                 # Sub off
 
@@ -232,7 +234,7 @@ soc.sh touch 0               # touch controls off
 
 soc.sh about                 # displayName=Beam Ultra, roomName=Living Room, ...
 soc.sh about displayVersion  # -> 27.3
-soc.sh settings              # bass=0, limit=100, loudness=0, ...
+soc.sh settings              # trueplay=1, bass=0, treble=0, ...
 ```
 
 Useful shell aliases:
@@ -287,7 +289,8 @@ In a group, playback and the queue go to the group's leader, whichever speaker `
 - **The TV in a group:** the soundbar leads any group that plays its TV, so `now` reads the TV's format from the leader. Handing the lead to another room ends the TV: that room leads with nothing loaded, and `now` shows `UNKNOWN`. Tested with a Beam Ultra and an Era 300.
 - **No bit rate:** the speaker reports sample rate, bit depth and whether a stream is lossless, but no bit rate.
 - **Speech Enhancement level 0** is accepted but ignored by the speaker, which is why `speech 0` uses the separate switch.
-- **Sub level** is stored as sent, even far outside the app's -15..15, so `level` checks the range before sending.
+- **Sub level** is stored as sent, even far outside the app's -15..15, so `sublevel` checks the range before sending.
+- **Sub settings without a Sub:** a speaker answers for the Sub's settings with no Sub bonded, so `settings` leaves them out unless the speaker's channel map in the topology has a Sub. Tested with an Era 300.
 - **No remote restart:** the speaker's old `/reboot` page answers `403 Forbidden`, and the restart the app uses needs a Sonos account login.
 
 ## Credits

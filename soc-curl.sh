@@ -445,24 +445,27 @@ playqueue() {
 }
 
 # Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in. A service path may
-# name another speaker, as http://<address>:1400/<path> - <service path> <action> [arguments] [<service path> <action>
-# <arguments>]...
+# name another speaker, as http://<address>:1400/<path>. With SOFT set, on through a refusal, each reply followed by
+# US and its HTTP status, 000 for none - <service path> <action> [arguments] [<service path> <action> <arguments>]...
 post() {
-  local args=() u urn
+  local args=() early=--fail-early u urn w=$'\x1e'
+
+  # SOFT: on through a failure, each reply with its HTTP status and curl's own for that transfer (curl 7.75)
+  [[ -z ${SOFT-} ]] || early=--no-fail-early w=$'\x1f%{http_code}:%{exitcode}\x1e'
 
   while :; do
     urn=urn:schemas-upnp-org:service:${1##*/}:1
     u=$1
     [[ $u == http://* ]] || u=$BASE/$1
     ((${#args[@]} == 0)) || args+=(--next)
-    args+=("${CURL[@]}" -w $'\x1e' "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
+    args+=("${CURL[@]}" -w "$w" "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
       -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>")
     (($# > 3)) || break
     shift 3
   done
   # One process, one request after the other; --fail-early stops at the first failure and keeps its status. Sonos
   # refuses an action with HTTP 500, so the ones after it aren't sent; a 200 is the action done
-  LC_ALL=C exec curl -q -s --fail-early "${args[@]}"
+  LC_ALL=C exec curl -q -s "$early" "${args[@]}"
 }
 
 # List the queue, marking the current track, or play from track n - [n]
@@ -565,49 +568,93 @@ soap() {
   reply "$2" "$rc"
 }
 
-# Print the Sound (vol and mute aside), Home theater, Sub audio and Hardware settings as option=value
+# Print the settings as option=value in the Sonos app's order: Sound (vol and mute aside), Sub audio, Home theater and
+# Hardware. One the speaker hasn't got is left out, as Home theater on an Era 300, and Sub audio without a bonded Sub
 settings() {
-  local calls=() i out='' p v=()
+  local a calls=() cms code fault='' hts i out='' p parts rc v=()
   # Option, then the request for its value; speech takes two, its switch (no option) and level
   local r=(
-    bass "$RC" GetBass ''
-    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
-    loudness "$RC" GetLoudness "$CH"
-    treble "$RC" GetTreble ''
     trueplay "$RC" GetRoomCalibrationStatus ''
+    bass "$RC" GetBass ''
+    treble "$RC" GetTreble ''
     height "$RC" GetEQ '<EQType>HeightChannelLevel</EQType>'
-    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
-    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    loudness "$RC" GetLoudness "$CH"
+    limit "$RC" GetEQ '<EQType>VolumeScalingFactor</EQType>'
+    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
+    sublevel "$RC" GetEQ '<EQType>SubGain</EQType>'
+    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
     '' "$RC" GetEQ '<EQType>SpeechEnhanceEnabled</EQType>'
     speech "$RC" GetEQ '<EQType>DialogLevel</EQType>'
-    level "$RC" GetEQ '<EQType>SubGain</EQType>'
-    phase "$RC" GetEQ '<EQType>SubPolarity</EQType>'
-    sub "$RC" GetEQ '<EQType>SubEnable</EQType>'
-    led "$DP" GetLEDState ''
+    night "$RC" GetEQ '<EQType>NightMode</EQType>'
+    lipsync "$RC" GetEQ '<EQType>AudioDelay</EQType>'
+    light "$DP" GetLEDState ''
     touch "$DP" GetButtonLockState ''
+    # No option either: for whether a Sub is bonded, the speaker's own address and the topology
+    '' "$DP" GetZoneInfo ''
+    '' ZoneGroupTopology GetZoneGroupState ''
   )
 
-  # One curl, one request after the other: ~175 ms, against ~255 ms with a curl each
+  [[ -n ${SONOS_IP-} ]] || error 204
+  # One curl, one request after the other: ~175 ms, against ~255 ms with a curl each. On through a refusal, a setting
+  # the speaker hasn't got: no value
   for ((i = 0; i < ${#r[@]}; i += 4)); do
     calls+=("${r[i + 1]}" "${r[i + 2]}" "${r[i + 3]}")
   done
-  soap "${calls[@]}"
-  REPLIES+=("$REPLY")
+  a=$(SOFT=1 post "${calls[@]}") || : # Its status is the last request's; each reply's comes with it
+  # In memory, at once: cut one by one, the topology's length made it ~35 ms
+  IFS=$'\x1e'
+  # shellcheck disable=SC2206 # split on the separator alone; no pathname expansion (set -f)
+  parts=($a)
+  IFS=$'\n\t'
+  ((${#parts[@]} == ${#r[@]} / 4)) || error 202 # Fewer replies than requests: curl stopped
   for ((i = 0; i < ${#r[@]}; i += 4)); do
-    REPLY=${REPLIES[i / 4]}
-    # The reply's first value; RoomCalibrationEnabled comes before Available
-    [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
-    [[ $REPLY =~ 'Response'[^\>]*'><'[[:alpha:]]+'>'($p)'</' ]] || error 202
-    v+=("${BASH_REMATCH[1]}")
+    REPLY=${parts[i / 4]}
+    code=${REPLY##*$'\x1f'} REPLY=${REPLY%$'\x1f'*}
+    rc=${code#*:} code=${code%%:*}
+    ((${#REPLY} <= MAX)) || error 63
+    # A transfer that failed by itself, as one cut short, holds no setting; a refusal comes as HTTP 500, curl's 22
+    ((rc == 0 || rc == 22)) || error "$rc" "${r[i + 2]}"
+    if [[ $code == 200 ]]; then
+      reply "${r[i + 2]}" # This action's own reply, not another's
+      # The reply's first value; RoomCalibrationEnabled comes before Available. The speaker's address, and the
+      # topology whole
+      case ${r[i + 2]} in
+      GetZoneInfo) p='<IPAddress>([0-9.]{7,15})</IPAddress>' ;;
+      GetZoneGroupState) p='^(.*)$' ;;
+      *)
+        [[ ${r[i + 1]} == "$DP" ]] && p='On|Off' || p='-?[0-9]{1,3}'
+        p="Response[^>]*><[[:alpha:]]+>($p)</"
+        ;;
+      esac
+      [[ $REPLY =~ $p ]] || error 202
+      v+=("${BASH_REMATCH[1]}")
+    elif [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
+      [[ -n $fault ]] || fault="${r[i + 2]} ${BASH_REMATCH[1]}"
+      v+=('')
+    else
+      error 22 "${r[i + 2]}"
+    fi
   done
 
-  # Speech is 0 while off; LED On is 1; the touch controls are on (1) while the buttons aren't locked
-  ((v[8])) || v[9]=0
-  [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0
-  [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0
+  # A speaker answers the Sub's settings without one: its channel map tells, with a Sub on SW, as
+  # RINCON_A:LF,RF;RINCON_B:SW (a soundbar's HTSatChanMapSet, a speaker's ChannelMapSet). Its member is the one at its
+  # own address, as SONOS_IP may be a name
+  if [[ -n ${v[6]} ]]; then
+    [[ -n ${v[15]} && -n ${v[16]} ]] || error 202
+    REPLY=${v[16]}
+    member hts HTSatChanMapSet Location "http://${v[15]}:1400/" || hts=''
+    member cms ChannelMapSet Location "http://${v[15]}:1400/" || cms=''
+    [[ $hts$cms == *[:,]SW* ]] || v[6]='' v[7]='' v[8]=''
+  fi
+  # Speech is 0 while off; the light On is 1; the touch controls are on (1) while the buttons aren't locked
+  [[ -z ${v[9]} ]] || ((v[9])) || v[10]=0
+  [[ -z ${v[13]} ]] || { [[ ${v[13]} == On ]] && v[13]=1 || v[13]=0; }
+  [[ -z ${v[14]} ]] || { [[ ${v[14]} == Off ]] && v[14]=1 || v[14]=0; }
   for ((i = 0; i < ${#r[@]}; i += 4)); do
-    [[ -z ${r[i]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
+    [[ -z ${r[i]} || -z ${v[i / 4]} ]] || out+=${r[i]}=${v[i / 4]}$'\n'
   done
+  # Nothing at all is no speaker's settings: the first refusal, as the option itself would report it
+  [[ -n $out ]] || error 203 "${fault% *}" "${fault#* }"
   printf %s "$out"
 }
 
@@ -713,7 +760,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.3 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.4 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -728,22 +775,21 @@ Sources:
   clear | queue 1..n | rescan
 
 Sound:
-  bass -10..10 | limit 1..100 | loudness 0..1 | mute 0..1
-  treble -10..10 | trueplay 0..1 | vol 0..100
-
-Home theater:
-  height -10..10 | lipsync 0..5 | night 0..1 | speech 0..4
+  bass -10..10 | height -10..10 | limit 1..100 | loudness 0..1
+  mute 0..1 | treble -10..10 | trueplay 0..1 | vol 0..100
 
 Sub audio:
-  level -15..15 | phase 0..1 | sub 0..1
+  phase 0..1 | sub 0..1 | sublevel -15..15
+
+Home theater:
+  lipsync 0..5 | night 0..1 | speech 0..4
 
 Hardware:
-  about | led 0..1 | settings | touch 0..1
+  about | light 0..1 | settings | touch 0..1
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
-About accepts a key (e.g. about modelName).
 In a group, playback and the queue go to its leader; vol and mute
 set every room to the same level.
 Requires SONOS_IP: the speaker's IP address or .local name."
@@ -861,20 +907,11 @@ height)
 limit)
   value EQ VolumeScalingFactor 1 100 "$arg"
   ;;
-lipsync)
-  value EQ AudioDelay 0 5 "$arg"
-  ;;
 loudness)
   value Loudness "$CH" 0 1 "$arg"
   ;;
 mute)
   mute "$arg"
-  ;;
-night)
-  value EQ NightMode 0 1 "$arg"
-  ;;
-speech)
-  speech "$arg"
   ;;
 treble)
   value Treble '' -10 10 "$arg"
@@ -885,19 +922,28 @@ trueplay)
 vol | volume)
   volume "$arg"
   ;;
-level)
-  value EQ SubGain -15 15 "$arg"
-  ;;
 phase)
   value EQ SubPolarity 0 1 "$arg"
   ;;
 sub)
   value EQ SubEnable 0 1 "$arg"
   ;;
+sublevel)
+  value EQ SubGain -15 15 "$arg"
+  ;;
+lipsync)
+  value EQ AudioDelay 0 5 "$arg"
+  ;;
+night)
+  value EQ NightMode 0 1 "$arg"
+  ;;
+speech)
+  speech "$arg"
+  ;;
 about)
   about "$arg"
   ;;
-led)
+light)
   onoff LEDState Off On "$arg"
   ;;
 settings)
