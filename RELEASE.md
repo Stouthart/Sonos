@@ -1,8 +1,18 @@
-<!-- 3.4 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.5 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.4 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.5 is the version distributed; the entries below it show how the scripts got there.
+
+## 3.5 - November 2026
+
+Radio as the Sonos app shows it: a station by its name and its picture, and Sonos Radio by name; and music services by name. Measured with 80s80s Dance and Qobuz on a Beam Ultra.
+
+- **A paused station by its name:** while paused, a station sends no song, and `now` printed its link's file name as the title, such as `regc-80s80sdance2523717-mp3-192-…?sABC=…`. It now prints the station's name, such as `80s80s Dance`, from one request more.
+- **No `ZPSTR_` codes:** for a few seconds after Play, the speaker sends `ZPSTR_CONNECTING`, then `ZPSTR_BUFFERING`, in place of the song, and `now` printed them as the title. It now prints the station's name meanwhile, as while paused.
+- **Sonos Radio by name:** its stations and their tracks showed as `[http]`, after their `x-sonos-http` links; `now` now says `[sonos-radio]`.
+- **Music services by name:** a track from Qobuz, TIDAL, Deezer, Apple Music, Amazon Music, YouTube Music, SoundCloud, Plex or IDAGIO showed as its link's scheme, such as `[http]`; `now` now names the service, such as `[qobuz]`, by its number in the link, as the speakers list it. Another service keeps its scheme. Spotify played from the Sonos app's queue no longer shows `spotify` as its format: the speaker reports none for it, only for Spotify Connect.
+- **A station's picture:** `artwork` printed nothing for a station whose song has no cover, as 80s80s Dance has none. It now prints the speaker's copy of the station's logo, by the station's link, from one request more. On Sonos Radio it always does, as the speaker's copy of a track's cover there can be another station's logo.
 
 ## 3.4 - November 2026
 

@@ -75,16 +75,28 @@ about() {
 # Track artwork URL on the network: relative ones are the player's, and for art elsewhere, as Spotify's on HTTPS, the
 # player serves its own copy by the track's URI
 artwork() {
-  local uri url
+  local kind uri url
 
   soap "$AVT" GetPositionInfo
   didl url upnp:albumArtURI
+  tag TrackURI
+  origin kind "${BASH_REMATCH[1]}"
+  # A station's own picture, as the Sonos app shows it, by the station's URI: Sonos Radio's always, as the speaker's
+  # copy of a track's cover there can be another station's logo; another station's when its song has none. One
+  # request more then
+  if [[ $kind == sonos-radio || ($kind == radio && -z $url) ]]; then
+    soap "$AVT" GetMediaInfo
+    didl url upnp:albumArtURI
+    tag CurrentURI
+    uri=${BASH_REMATCH[1]}
+  else
+    res uri
+  fi
   if [[ $url == /* ]]; then
     url=http://$HOST:1400$url
   elif [[ -n $url ]] && ! lan "$url"; then
-    # Elsewhere, as Spotify's on HTTPS or a station's logo on the internet: the speaker's copy by the track's URI,
-    # unescaped once (res keeps one level for SOAP), or none when there's no URI to ask by
-    res uri
+    # Elsewhere, as Spotify's on HTTPS or a station's logo on the internet: the speaker's copy by the track's URI, or
+    # the station's, unescaped once (res and CurrentURI keep one level for SOAP), or none when there's no URI to ask by
     url=''
     [[ -z $uri ]] || {
       uri=${uri//&amp;/\&} # Unquoted: quoted, Bash 3.2 keeps the \; bare, from Bash 5.2 & stands for the match
@@ -139,6 +151,43 @@ dechunk() {
   [[ ${b:i:82} =~ $re && $((16#${BASH_REMATCH[1]})) == 0 && ${b:i+${#BASH_REMATCH[0]}} == $'\r\n' ]] || error 202
 }
 
+# The source of a track URI, as SOAP escapes it: the URI scheme, or for Virtual Line-In the service after the comma;
+# line-in and radio by name, as both stream; a music service by its number, Sonos Radio's on radio too; and a group
+# member's own as group - <var> <uri>
+origin() {
+  local n='' re='[?&;]sid=([0-9]{1,5})(&|$)' s=${2%%:*}
+
+  # The service's number in a Sonos link's query, as x-sonos-http:…?sid=31; the ; of an escaped &amp;
+  [[ $2 != x-sonos* || ! $2 =~ $re ]] || n=${BASH_REMATCH[1]}
+  case $s in
+  x-file-cifs) s='file' ;;
+  x-sonos-htastream) s=tv ;;
+  x-sonos-vli) s=${2#*,} s=${s%%:*} ;;
+  x-rincon) s=group ;;
+  x-rincon-stream) s=line-in ;;
+  aac | hls-radio | x-rincon-mp3radio | x-sonosapi-hls | x-sonosapi-radio | x-sonosapi-stream) s=radio ;;
+  *)
+    # The common on-demand services by the numbers the speakers list them by (ListAvailableServices); any other by
+    # its link's scheme, as http
+    case $n in
+    2) s=deezer ;;
+    31) s=qobuz ;;
+    160) s=soundcloud ;;
+    174) s=tidal ;;
+    201) s=amazon-music ;;
+    204) s=apple-music ;;
+    212) s=plex ;;
+    271) s=idagio ;;
+    284) s=youtube-music ;;
+    *) s=${s#x-} s=${s#sonos-} s=${s#sonosapi-} s=${s#rincon-} ;;
+    esac
+    ;;
+  esac
+  # Sonos Radio, 303: its stations and the tracks they play
+  [[ $n != 303 ]] || s=sonos-radio
+  printf -v "$1" %s "${s//[^[:alnum:]._-]/}"
+}
+
 # Print prefix, then "artist / title [album]" of REPLY's DIDL-Lite (radio: stream content as title) - <prefix>
 desc() {
   local alb art q tit
@@ -147,7 +196,8 @@ desc() {
   didl art dc:creator
   didl tit dc:title
   didl q r:streamContent
-  [[ -z $q ]] || tit=$q
+  # Not the speaker's own state while it connects, ZPSTR_CONNECTING or ZPSTR_BUFFERING, which the Sonos app hides
+  [[ -z $q || $q == ZPSTR_* ]] || tit=$q
   tit=$art${art:+${tit:+ / }}$tit${alb:+ [$alb]}
   printf '%s%s\n' "$1" "${tit:-UNKNOWN}"
 }
@@ -330,7 +380,7 @@ mute() {
 
 # Print "artist / title [album]", then position, duration, quality (TV: input format) and source
 now() {
-  local bits=0 c dur fmt='' loss='' lq=(lossy lossless) pos q='' rate=0 src tvf
+  local bits=0 c dur fmt='' link loss='' lq=(lossy lossless) pos q='' rate=0 src t tvf u
 
   # The TV input format alongside, dropped unread for other sources: no measurable cost, ~10 ms less on TV
   send 3 "$AVT" GetPositionInfo
@@ -352,23 +402,14 @@ now() {
   # Files report no stream info, only the format in their MIME type (x-flac as flac); a cast from a UPnP app
   # also carries its own rate and bit depth
   [[ $REPLY =~ 'protocolInfo=&quot;'[[:alnum:].-]+':'[^:]*':audio/'([[:alnum:].+-]+)':' ]] && fmt=${BASH_REMATCH[1]#x-}
+  # Spotify from the Sonos app's queue: audio/x-spotify names the service, not a format
+  [[ $fmt != spotify ]] || fmt=''
   ((rate == 0)) && [[ $REPLY =~ 'sampleFrequency=&quot;'([0-9]{4,7})'&quot;' ]] && rate=$((10#${BASH_REMATCH[1]}))
   ((bits == 0)) && [[ $REPLY =~ 'bitsPerSample=&quot;'([0-9]{1,2})'&quot;' ]] && bits=$((10#${BASH_REMATCH[1]}))
 
-  # Source: the URI scheme, or for Virtual Line-In the service after the comma; line-in and radio by name, as both
-  # stream, and a group member's own as group
   tag TrackURI
-  src=${BASH_REMATCH[1]%%:*}
-  case $src in
-  x-file-cifs) src='file' ;;
-  x-sonos-htastream) src=tv ;;
-  x-sonos-vli) src=${BASH_REMATCH[1]#*,} src=${src%%:*} ;;
-  x-rincon) src=group ;;
-  x-rincon-stream) src=line-in ;;
-  aac | hls-radio | x-rincon-mp3radio | x-sonosapi-hls | x-sonosapi-radio | x-sonosapi-stream) src=radio ;;
-  *) src=${src#x-} src=${src#sonos-} src=${src#sonosapi-} src=${src#rincon-} ;;
-  esac
-  src=${src//[^[:alnum:]._-]/}
+  link=${BASH_REMATCH[1]}
+  origin src "$link"
 
   # kHz as %g would print it, without its locale switch
   if ((rate)); then
@@ -379,6 +420,15 @@ now() {
 
   ((bits)) && bits=" ${bits}bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
+  # A station whose title is no more than its link's file name, as while it's paused and sends no song, or while the
+  # speaker connects (desc): its name from GetMediaInfo instead, one request more then
+  if [[ $src == radio ]]; then
+    didl t dc:title
+    didl c r:streamContent
+    [[ $c != ZPSTR_* ]] || c=''
+    u=${link%%\?*} u=${u##*/}
+    [[ -n $c || -z $u || ${t%%\?*} != "$u" ]] || soap "$AVT" GetMediaInfo
+  fi
   desc ''
   if [[ $src == tv ]]; then
     # The input format's code, by name; an unknown one shows as a number
@@ -807,7 +857,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.4 - Control Sonos over UPnP
+  printf '%s\n' "$nm 3.5 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]

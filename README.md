@@ -1,4 +1,4 @@
-<!-- 3.4 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 3.5 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.4**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 3.5**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -81,9 +81,9 @@ Options that only act (`play`, `vol 40`) print nothing; the exit code tells you 
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds or a `min:sec` position (`seek 219` and `seek 3:39` are the same jump), either with an optional `+` or `-`. Both forms top out at `3599` and `59:59`, and the seconds in `min:sec` are always two digits. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
 
-`artwork` prints a URL on your network for the current track's artwork: the music library's own link, a UPnP server's at a private address, or an image the speaker serves itself. That includes its copy of any cover on the internet, such as Spotify's or a radio station's logo, so opening it doesn't reach the internet; when the speaker has no copy to give, `artwork` prints nothing rather than the outside link. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
+`artwork` prints a URL on your network for the current track's artwork: the music library's own link, a UPnP server's at a private address, or an image the speaker serves itself. That includes its copy of any cover on the internet, such as Spotify's or a radio station's logo, so opening it doesn't reach the internet; when the speaker has no copy to give, `artwork` prints nothing rather than the outside link. For a station it's the station's own picture, as the Sonos app shows it: when the song has none, and always on Sonos Radio, where the speaker's copy of a track's cover can be another station's logo. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, with `line-in` and `radio` by name, and reads `UNKNOWN` when there is none.
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title, and the station's name shows while it's paused or connecting. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, with `line-in`, `radio` and `sonos-radio` by name, and the common music services by their number in it, as the speakers list them: `qobuz`, `tidal`, `deezer`, `apple-music`, `amazon-music`, `youtube-music`, `soundcloud`, `plex` and `idagio`. Another service shows its address's scheme, such as `http`, and reads `UNKNOWN` when there is none.
 
 On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
 
