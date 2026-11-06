@@ -1,8 +1,16 @@
-<!-- 3.5 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 4.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x and 2.x condensed per major version. 3.5 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x and 2.x condensed per major version. 4.0 is the version distributed; the entries below it show how the scripts got there.
+
+## 4.0 - November 2026
+
+A station by its name in every case, and its picture with one request less; a playlist favorite from its first track, also with shuffle on.
+
+- **A station's name, always:** `now` printed `UNKNOWN` for a station that sends no track info, as some do while starting, and Sonos Radio never fell back on its station's name. Both now print the station's name, such as `80s80s Dance`, from one request more then.
+- **A playlist favorite from its first track, also with shuffle on:** `favorites n` on a playlist or album started another track while shuffle was on, even one queued before, as the speaker counts the position it reports in its shuffled order. Shuffle is now off while the playlist is added and its first track starts, then on again, which shuffles the rest.
+- **One request less for a station's picture:** `artwork` reuses the speaker's answer from finding a group's leader, when there's none to follow; in a group led by another speaker it asks that one, as before.
 
 ## 3.5 - November 2026
 

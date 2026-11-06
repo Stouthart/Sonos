@@ -8,6 +8,8 @@ BASE=http://${SONOS_IP-}:1400
 # 1: the option plays or queues, which in a group only its leader does, so the first request finds that one first; 2:
 # found, or not needed
 LEADER=0
+# The GetMediaInfo reply that finding the leader got, when there was none to follow: artwork reuses it
+MEDIA=''
 # Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
@@ -79,10 +81,10 @@ artwork() {
   tag TrackURI
   origin kind "${BASH_REMATCH[1]}"
   # A station's own picture, as the Sonos app shows it, by the station's URI: Sonos Radio's always, as the speaker's
-  # copy of a track's cover there can be another station's logo; another station's when its song has none. One
-  # request more then
+  # copy of a track's cover there can be another station's logo; another station's when its song has none. From
+  # the GetMediaInfo that finding the leader got, else one request more
   if [[ $kind == sonos-radio || ($kind == radio && -z $url) ]]; then
-    soap "$AVT" GetMediaInfo
+    if [[ -n $MEDIA ]]; then REPLY=$MEDIA; else soap "$AVT" GetMediaInfo; fi
     didl url upnp:albumArtURI
     tag CurrentURI
     uri=${BASH_REMATCH[1]}
@@ -177,7 +179,7 @@ didl() {
 
 # List favorites, or play favorite n; containers go through the queue - [n]
 favorites() {
-  local md='' uri
+  local add md='' mode off='' uri
 
   if [[ -z $1 ]]; then
     list FV:2
@@ -196,10 +198,24 @@ favorites() {
 
   case $uri in
   x-rincon-cpcontainer:* | x-rincon-playlist:* | file:*)
-    soap "$AVT" AddURIToQueue \
-      "<EnqueuedURI>$uri</EnqueuedURI><EnqueuedURIMetaData>$md</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>"
+    # With shuffle on, the speaker mixes the tracks added into its shuffled order and counts positions in that, so the
+    # one it reports may be another's, even one queued before: shuffle off while they're added and the first starts,
+    # then on again, which shuffles the rest and keeps that one playing. Left off if the speaker refuses on the way
+    soap "$AVT" GetTransportSettings
+    tag PlayMode '[A-Z_]{1,20}'
+    mode=${BASH_REMATCH[1]}
+    case $mode in
+    SHUFFLE_NOREPEAT) off=NORMAL ;;
+    SHUFFLE) off=REPEAT_ALL ;;
+    SHUFFLE_REPEAT_ONE) off=REPEAT_ONE ;;
+    esac
+    add=("$AVT" AddURIToQueue
+      "<EnqueuedURI>$uri</EnqueuedURI><EnqueuedURIMetaData>$md</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
+    # Shuffle off in the same curl run: the add's reply comes last
+    if [[ -n $off ]]; then soap "$AVT" SetPlayMode "<NewPlayMode>$off</NewPlayMode>" "${add[@]}"; else soap "${add[@]}"; fi
     tag FirstTrackNumberEnqueued '[0-9]{1,5}'
     playqueue "${BASH_REMATCH[1]}"
+    [[ -z $off ]] || soap "$AVT" SetPlayMode "<NewPlayMode>$mode</NewPlayMode>"
     ;;
   *)
     soap "$AVT" SetAVTransportURI "<CurrentURI>$uri</CurrentURI><CurrentURIMetaData>$md</CurrentURIMetaData>" \
@@ -254,7 +270,8 @@ lan() {
 leader() {
   LEADER=2
   soap "$AVT" GetMediaInfo
-  follow || :
+  # Kept for artwork, unless it named a leader: that one's own is asked then
+  if follow; then MEDIA=''; else MEDIA=$REPLY; fi
 }
 
 # Print a container's items as "n) artist / title [album]", "> " marking item cur if its res is uri;
@@ -364,14 +381,15 @@ now() {
 
   ((bits)) && bits=" ${bits}bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
-  # A station whose title is no more than its link's file name, as while it's paused and sends no song, or while the
-  # speaker connects (desc): its name from GetMediaInfo instead, one request more then
-  if [[ $src == radio ]]; then
+  # A station, Sonos Radio's too, with no title, as some send while starting, or one that's no more than its link's
+  # file name, as while it's paused and sends no song, or while the speaker connects (desc): its name from
+  # GetMediaInfo instead, one request more then
+  if [[ $src == radio || $src == sonos-radio ]]; then
     didl t dc:title
     didl c r:streamContent
     [[ $c != ZPSTR_* ]] || c=''
     u=${link%%\?*} u=${u##*/}
-    [[ -n $c || -z $u || ${t%%\?*} != "$u" ]] || soap "$AVT" GetMediaInfo
+    [[ -n $c || (-n $t && (-z $u || ${t%%\?*} != "$u")) ]] || soap "$AVT" GetMediaInfo
   fi
   desc ''
   if [[ $src == tv ]]; then
@@ -810,7 +828,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 3.5 - Control Sonos over UPnP
+  printf '%s\n' "$nm 4.0 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]

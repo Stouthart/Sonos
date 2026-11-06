@@ -1,4 +1,4 @@
-<!-- 3.5 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 4.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 3.5**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 4.0**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -83,7 +83,7 @@ A bare `seek` prints the position in whole seconds. To move, pass seconds or a `
 
 `artwork` prints a URL on your network for the current track's artwork: the music library's own link, a UPnP server's at a private address, or an image the speaker serves itself. That includes its copy of any cover on the internet, such as Spotify's or a radio station's logo, so opening it doesn't reach the internet; when the speaker has no copy to give, `artwork` prints nothing rather than the outside link. For a station it's the station's own picture, as the Sonos app shows it: when the song has none, and always on Sonos Radio, where the speaker's copy of a track's cover can be another station's logo. With no artwork it prints nothing and succeeds, so check for a URL before opening it: `u=$(soc.sh artwork) && [[ -n $u ]] && open -u "$u"` shows it on macOS.
 
-`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title, and the station's name shows while it's paused or connecting. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, with `line-in`, `radio` and `sonos-radio` by name, and the common music services by their number in it, as the speakers list them: `qobuz`, `tidal`, `deezer`, `apple-music`, `amazon-music`, `youtube-music`, `soundcloud`, `plex` and `idagio`. Another service shows its address's scheme, such as `http`, and reads `UNKNOWN` when there is none.
+`now` prints artist, title and album on the first line, and position, duration, quality and source on the second. Missing fields are dropped rather than filled in; on radio, the stream's own text replaces the title, and the station's name shows while it's paused or connecting, or when it sends no track info, on Sonos Radio too. Quality is `lossy` or `lossless`, sample rate and bit depth, as far as the speaker reports them. It reports no bit rate, and for a file none of these, so `now` shows the format from the file's MIME type instead, such as `mpeg` for MP3 or `flac`. A track cast from a UPnP app brings its own sample rate and bit depth, as in `flac 44.1kHz 16bit`. The source is taken from the stream address, such as `spotify` or `tv`, with `line-in`, `radio` and `sonos-radio` by name, and the common music services by their number in it, as the speakers list them: `qobuz`, `tidal`, `deezer`, `apple-music`, `amazon-music`, `youtube-music`, `soundcloud`, `plex` and `idagio`. Another service shows its address's scheme, such as `http`, and reads `UNKNOWN` when there is none.
 
 On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
 
@@ -100,7 +100,7 @@ On the TV input, which has no title, position or duration, quality is the format
 | `queue [1..n]`     | List the queue, or play from track _n_ (alias: `playqueue`)          |
 | `rescan`           | Scan the music library for new content                               |
 
-`favorites` lists the app's **Sonos Favorites**, numbered from 1 in the app's order. `favorites 2` plays the second: a station or track replaces what is playing, and a playlist or album is added to the end of the queue and played from its first track. Some favorites are only shortcuts into the app, such as the Sonos Radio ones Sonos adds itself; they have nothing to play over UPnP and exit `205`. Playing a station or playlist favorite is untested so far, as the test speaker has only shortcuts.
+`favorites` lists the app's **Sonos Favorites**, numbered from 1 in the app's order. `favorites 2` plays the second: a station or track replaces what is playing, and a playlist or album is added to the end of the queue and played from its first track, also with shuffle on. Some favorites are only shortcuts into the app, such as the Sonos Radio ones Sonos adds itself; they have nothing to play over UPnP and exit `205`. Station favorites are tested, such as 80s80s Dance; a playlist's steps were tested by hand with a Music library playlist, as the test speaker's favorites hold none.
 
 `file` plays one file from an SMB share, given as `//host/share/path` including the file's extension, e.g. `soc.sh file //192.168.1.10/podcasts/episode.mp3`. It replaces what is playing, and `now` shows the source as `file`. The speaker needs read access to the share; a share in its music library works with the login stored there. Characters other than ASCII letters, digits and `/._~+-` are percent-encoded as UTF-8, so names with spaces or accents work as they are.
 
