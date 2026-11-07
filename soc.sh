@@ -247,10 +247,13 @@ favorites() {
     soap "$AVT" GetTransportSettings
     tag PlayMode '[A-Z_]{1,20}'
     mode=${BASH_REMATCH[1]}
+    # A mode it doesn't know is refused, as repeat does: it may be a shuffle the speaker can't be taken out of
     case $mode in
+    NORMAL | REPEAT_ONE | REPEAT_ALL) ;;
     SHUFFLE_NOREPEAT) off=NORMAL ;;
     SHUFFLE) off=REPEAT_ALL ;;
     SHUFFLE_REPEAT_ONE) off=REPEAT_ONE ;;
+    *) error 202 ;;
     esac
     add=("$AVT" AddURIToQueue
       "<EnqueuedURI>$uri</EnqueuedURI><EnqueuedURIMetaData>$md</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
@@ -430,12 +433,12 @@ now() {
 
   # kHz as %g would print it, without its locale switch
   if ((rate)); then
-    q=$((rate % 1000 + 1000)) q=${q#1} q=${q%0} q=${q%0} q=${q%0} rate=" $((rate / 1000))${q:+.$q}kHz"
+    q=$((rate % 1000 + 1000)) q=${q#1} q=${q%0} q=${q%0} q=${q%0} rate=" $((rate / 1000))${q:+.$q} kHz"
   else
     rate=''
   fi
 
-  ((bits)) && bits=" ${bits}bit" || bits=''
+  ((bits)) && bits=" ${bits}-bit" || bits=''
   q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
   # A station, Sonos Radio's too, with no title, as some send while starting, or one that's no more than its link's
   # file name, as while it's paused and sends no song, or while the speaker connects (desc): its name from
@@ -783,7 +786,7 @@ speech() {
     fi
   elif [[ $1 =~ ^[0-4]$ ]]; then
     # Level 0 is accepted but ignored; off is a separate switch. Written one after the other: the level only once the
-    # switch took, as in soc-curl.sh
+    # switch took
     soap "$RC" SetEQ "$se<DesiredValue>$(($1 > 0))</DesiredValue>"
     (($1 == 0)) || soap "$RC" SetEQ "$dl<DesiredValue>$1</DesiredValue>"
   else
@@ -875,7 +878,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 4.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 4.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
