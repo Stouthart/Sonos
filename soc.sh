@@ -26,8 +26,8 @@ MB=$'\xc3\xa9'
 TE=$'\r\n[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]:[^\r]*[Cc][Hh][Uu][Nn][Kk][Ee][Dd]'
 CS=$'^([[:xdigit:]]{1,8})(;[^\r]*)?\r\n'
 CN=$'^\r\n([[:xdigit:]]{1,8})(;[^\r]*)?\r\n' # From the second on: led by the chunk before's CRLF
-# Otherwise the body's length, by its header in any case
-CL=$'\r\n[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[ \t]*([0-9]{1,8})[ \t]*\r\n'
+# Otherwise the body's length, by its header in any case; any value, which dechunk checks
+CL=$'\r\n[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:([^\r]*)\r\n'
 
 [[ ${1-} == --xdbg ]] && {
   shift
@@ -123,6 +123,8 @@ dechunk() {
 
   b=${REPLY#*$'\r\n\r\n'}
   h=${REPLY:0:${#REPLY}-${#b}}
+  # No blank line after the headers: no body, and the headers mustn't pass for one, as a response's name in them
+  [[ -n $h ]] || error 202
   if [[ ! $h =~ $TE ]]; then
     REPLY=$b
     n=${#b}
@@ -133,6 +135,8 @@ dechunk() {
     }
     ((n <= MAX)) || error 202
     [[ $h =~ $CL ]] || return 0
+    # Digits alone, blanks around them, no more than the cap has: anything else, as 123456789 or 12x, is corrupt
+    [[ ${BASH_REMATCH[1]} =~ ^[[:blank:]]*0*([0-9]{1,8})[[:blank:]]*$ ]] || error 202
     ((n == 10#${BASH_REMATCH[1]})) || error 202
     return
   fi
@@ -291,7 +295,8 @@ follow() {
   id=${BASH_REMATCH[1]}
   soap ZoneGroupTopology GetZoneGroupState
   member loc Location UUID "$id&quot;" || error 202
-  [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+  # On the local network only, as a cover: an address elsewhere is never asked
+  lan "$loc" && [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
   HOST=${BASH_REMATCH[1]}
 }
 
@@ -467,8 +472,9 @@ now() {
   else
     exec 4<&-
   fi
-  printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
-    "${src:-UNKNOWN}"
+  clock pos "$pos"
+  clock dur "$dur"
+  printf '%s / %s%s [%s]\n' "$pos" "$dur" "${q:+ -$q}" "${src:-UNKNOWN}"
 }
 
 # Get or set an On/Off device property as 0 or 1 - <property> <state for 0> <state for 1> [0..1]
@@ -651,7 +657,16 @@ secs() {
   fi
 }
 
-# Get or seek position (±) - [sec | min:sec]
+# Seconds as m:ss, or from an hour on as h:mm:ss - <var> <seconds>
+clock() {
+  if (($2 < 3600)); then
+    printf -v "$1" '%d:%02d' $(($2 / 60)) $(($2 % 60))
+  else
+    printf -v "$1" '%d:%02d:%02d' $(($2 / 3600)) $(($2 / 60 % 60)) $(($2 % 60))
+  fi
+}
+
+# Get or seek position (±) - [sec | min:sec | h:mm:ss]
 seek() {
   local pos sign unit=REL_TIME val
 
@@ -664,6 +679,8 @@ seek() {
     val=${BASH_REMATCH[2]} sign=${BASH_REMATCH[1]}
   elif [[ $1 =~ ^([+-]?)([0-5]?[0-9]):([0-5][0-9])$ ]]; then
     val=$((10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]})) sign=${BASH_REMATCH[1]}
+  elif [[ $1 =~ ^([+-]?)([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])$ ]]; then
+    val=$((10#${BASH_REMATCH[2]} * 3600 + 10#${BASH_REMATCH[3]} * 60 + 10#${BASH_REMATCH[4]})) sign=${BASH_REMATCH[1]}
   else
     error 201
   fi
@@ -838,7 +855,8 @@ together() {
   while [[ $ids == RINCON_* ]]; do
     id=${ids%%,*} ids=${ids#*,}
     member loc Location UUID "$id&quot;" || error 202
-    [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+    # On the local network only, as a cover: an address elsewhere is never asked
+    lan "$loc" && [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
     hosts+=("${BASH_REMATCH[1]}")
   done
   # Seven at a time, on fds 3 to 9, as settings
@@ -878,7 +896,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 4.1 - Control Sonos over UPnP
+  printf '%s\n' "$nm 4.2 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -907,7 +925,8 @@ Hardware:
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
-Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
+Seek also accepts a min:sec or h:mm:ss position or offset
+(e.g. 3:39, 1:15:00, -1:30).
 In a group, playback and the queue go to its leader; vol and mute
 set every room to the same level.
 Requires SONOS_IP: the speaker's IPv4 address."

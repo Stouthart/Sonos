@@ -1,8 +1,16 @@
-<!-- 4.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 4.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 4.1 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 4.2 is the version distributed; the entries below it show how the scripts got there.
+
+## 4.2 - November 2026
+
+Hours in `now` and `seek`, a group's speakers held to the local network, and stricter reply checks.
+
+- **Hours:** `now` shows a time from an hour on as `h:mm:ss`, such as `6:25 / 1:00:00`, where it counted minutes on, as `60:00`. `seek` also takes `h:mm:ss`, as a position or an offset, such as `seek 1:15:00` or `seek -1:00:00`, so a long mix can be sought past its first hour. Seconds and `min:sec` work as before, and a bare `seek` still prints whole seconds.
+- **A group's speakers on the local network:** a group's leader, and the rooms `vol` and `mute` set together, must be at a private, link-local or loopback IPv4 address, as a cover must. An address elsewhere is never asked: the script exits `202`.
+- **Stricter reply checks:** `soc.sh` refuses a reply without the blank line after its headers, where a response's name in a header could pass for the speaker's answer, and one whose `Content-Length` isn't a number alone, such as `400x`, or is longer than the 16 MiB cap allows. `soc-curl.sh` counts that cap in bytes also where Bash counts characters, as in UTF-8 or on Android, where a reply of multibyte text could pass it.
 
 ## 4.1 - November 2026
 

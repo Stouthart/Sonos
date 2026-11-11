@@ -16,6 +16,8 @@ PG=100
 # Per transfer; --next resets them. A reply over 16 MiB is refused, as soc.sh's read cap does; before curl 8.4,
 # --max-filesize can't stop one of unknown length, as Browse's chunked replies, so get and reply check what came
 MAX=16777216
+# A 2-byte character: its length shows whether Bash counts bytes (C locale) or characters (UTF-8; Android always)
+MB=$'\xc3\xa9'
 CURL=(-g --noproxy '*' -4 -m2 --max-filesize "$MAX" -HUser-Agent: --fail-with-body
   '-HContent-Type: text/xml; charset="utf-8"')
 
@@ -248,15 +250,27 @@ follow() {
   id=${BASH_REMATCH[1]}
   soap ZoneGroupTopology GetZoneGroupState
   member loc Location UUID "$id&quot;" || error 202
-  [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+  # On the local network only, as a cover: an address elsewhere is never asked
+  lan "$loc" && [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
   BASE=http://${BASH_REMATCH[1]}:1400
+}
+
+# REPLY within MAX bytes, else 63, as curl's own cap: checked after the transfer, for a reply of unknown length before
+# curl 8.4. Where Bash counts characters, ${#REPLY} can't tell; printf's precision cuts bytes, so one it shortens is over
+fits() {
+  local c
+
+  ((${#REPLY} <= MAX)) || error 63
+  ((${#MB} == 2)) && return
+  printf -v c '%.*s' "$MAX" "$REPLY"
+  [[ $c == "$REPLY" ]] || error 63
 }
 
 # GET a page into REPLY - <path>
 get() {
   [[ -n ${SONOS_IP-} ]] || error 204
   REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" "$BASE/$1") || error $? "$1"
-  ((${#REPLY} <= MAX)) || error 63
+  fits
 }
 
 # Number within max; sets BASH_REMATCH - <arg> <max>
@@ -409,8 +423,9 @@ now() {
     tvf+='|118489148=Dolby TrueHD 7.1'
     [[ $tvf =~ "|$c="([^|]*) ]] && q+=" ${BASH_REMATCH[1]}" || q+=" format $c"
   fi
-  printf '%d:%02d / %d:%02d%s [%s]\n' $((pos / 60)) $((pos % 60)) $((dur / 60)) $((dur % 60)) "${q:+ -$q}" \
-    "${src:-UNKNOWN}"
+  clock pos "$pos"
+  clock dur "$dur"
+  printf '%s / %s%s [%s]\n' "$pos" "$dur" "${q:+ -$q}" "${src:-UNKNOWN}"
 }
 
 # Get or set an On/Off device property as 0 or 1 - <property> <state for 0> <state for 1> [0..1]
@@ -559,7 +574,7 @@ queue() {
 
 # Check REPLY to an action; exits on fault, curl error or foreign reply - <action> [curl status]
 reply() {
-  ((${#REPLY} <= MAX)) || error 63
+  fits
   # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
   ((${2-0} == 0)) && [[ $REPLY == *:"$1"Response[[:space:]/\>]* || $REPLY == *\<"$1"Response[[:space:]/\>]* ]] && return
   [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$1" "${BASH_REMATCH[1]}"
@@ -593,7 +608,16 @@ secs() {
   fi
 }
 
-# Get or seek position (±) - [sec | min:sec]
+# Seconds as m:ss, or from an hour on as h:mm:ss - <var> <seconds>
+clock() {
+  if (($2 < 3600)); then
+    printf -v "$1" '%d:%02d' $(($2 / 60)) $(($2 % 60))
+  else
+    printf -v "$1" '%d:%02d:%02d' $(($2 / 3600)) $(($2 / 60 % 60)) $(($2 % 60))
+  fi
+}
+
+# Get or seek position (±) - [sec | min:sec | h:mm:ss]
 seek() {
   local pos sign unit=REL_TIME val
 
@@ -606,6 +630,8 @@ seek() {
     val=${BASH_REMATCH[2]} sign=${BASH_REMATCH[1]}
   elif [[ $1 =~ ^([+-]?)([0-5]?[0-9]):([0-5][0-9])$ ]]; then
     val=$((10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]})) sign=${BASH_REMATCH[1]}
+  elif [[ $1 =~ ^([+-]?)([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])$ ]]; then
+    val=$((10#${BASH_REMATCH[2]} * 3600 + 10#${BASH_REMATCH[3]} * 60 + 10#${BASH_REMATCH[4]})) sign=${BASH_REMATCH[1]}
   else
     error 201
   fi
@@ -684,7 +710,7 @@ settings() {
     REPLY=${parts[i / 4]}
     code=${REPLY##*$'\x1f'} REPLY=${REPLY%$'\x1f'*}
     rc=${code#*:} code=${code%%:*}
-    ((${#REPLY} <= MAX)) || error 63
+    fits
     # A transfer that failed by itself, as one cut short, holds no setting; a refusal comes as HTTP 500, curl's 22
     ((rc == 0 || rc == 22)) || error "$rc" "${r[i + 2]}"
     if [[ $code == 200 ]]; then
@@ -799,7 +825,8 @@ together() {
   while [[ $ids == RINCON_* ]]; do
     id=${ids%%,*} ids=${ids#*,}
     member loc Location UUID "$id&quot;" || error 202
-    [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
+    # On the local network only, as a cover: an address elsewhere is never asked
+    lan "$loc" && [[ $loc =~ ^http://([0-9]{1,3}(\.[0-9]{1,3}){3}):1400/ ]] || error 202
     calls+=("http://${BASH_REMATCH[1]}:1400/$RC" "Set${e#Desired}" "$CH<$e>$to</$e>")
   done
   # One curl, one room after the other: each room's volume stands alone, so the replies are checked after the run
@@ -831,7 +858,7 @@ tv() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 4.1 - Control Sonos over UPnP
+  printf '%s\n' "$nm 4.2 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -860,7 +887,8 @@ Hardware:
 
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
-Seek also accepts a min:sec position or offset (e.g. 3:39, -1:30).
+Seek also accepts a min:sec or h:mm:ss position or offset
+(e.g. 3:39, 1:15:00, -1:30).
 In a group, playback and the queue go to its leader; vol and mute
 set every room to the same level.
 Requires SONOS_IP: the speaker's IP address or .local name."
