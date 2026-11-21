@@ -10,6 +10,8 @@ BASE=http://${SONOS_IP-}:1400
 LEADER=0
 # The GetMediaInfo reply that finding the leader got, when there was none to follow: artwork reuses it
 MEDIA=''
+# The play mode to put back should the script end on its way: shuffle is off while tracks go in (enqueue)
+RESTORE=''
 # Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
@@ -23,6 +25,8 @@ CURL=(-g --noproxy '*' -4 -m2 --max-filesize "$MAX" -HUser-Agent: --fail-with-bo
 
 # Service paths; Master channel argument
 AVT=MediaRenderer/AVTransport CH='<Channel>Master</Channel>' DP=DeviceProperties RC=MediaRenderer/RenderingControl
+# The Sonos app's key for the speakers' newer API, which port 1400 serves too: public, the same for everyone
+KEY=123e4567-e89b-12d3-a456-426655440000
 # C1 controls (U+0080..U+009F) in UTF-8, which [[:cntrl:]] only matches in a UTF-8 locale
 C1=$'\xc2[\x80-\x9f]'
 
@@ -50,6 +54,12 @@ error() {
   esac
 
   printf '%s\n' "$msg" >&2
+  # A play mode switched off on the way back on, as far as the speaker lets it: once, in a subshell, so a failure
+  # there ends only that; the error stands
+  [[ -z $RESTORE ]] || {
+    msg=$RESTORE RESTORE=''
+    (soap "$AVT" SetPlayMode "<NewPlayMode>$msg</NewPlayMode>") >/dev/null 2>&1 || :
+  }
   exit "$1"
 }
 
@@ -179,9 +189,42 @@ didl() {
   printf -v "$1" %s "${v//$C1/}"
 }
 
+# Add a container or track at the queue's end and play from its first track. With shuffle on, the speaker mixes the
+# tracks added into its shuffled order and counts positions in that, so the one it reports may be another's, even one
+# queued before: shuffle off while they're added and the first starts, then on again, which shuffles the rest and
+# keeps that one playing; on again also when adding or starting fails (error) - <uri> <metadata>, escaped as in a
+# SOAP body
+enqueue() {
+  local add mode off=''
+
+  soap "$AVT" GetTransportSettings
+  tag PlayMode '[A-Z_]{1,20}'
+  mode=${BASH_REMATCH[1]}
+  # A mode it doesn't know is refused, as repeat does: it may be a shuffle the speaker can't be taken out of
+  case $mode in
+  NORMAL | REPEAT_ONE | REPEAT_ALL) ;;
+  SHUFFLE_NOREPEAT) off=NORMAL ;;
+  SHUFFLE) off=REPEAT_ALL ;;
+  SHUFFLE_REPEAT_ONE) off=REPEAT_ONE ;;
+  *) error 202 ;;
+  esac
+  add=("$AVT" AddURIToQueue
+    "<EnqueuedURI>$1</EnqueuedURI><EnqueuedURIMetaData>$2</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
+  [[ -z $off ]] || {
+    soap "$AVT" SetPlayMode "<NewPlayMode>$off</NewPlayMode>"
+    RESTORE=$mode
+  }
+  # Sonos reads an album or playlist from its service first: more than curl's 2 s, at times
+  SLOW=1 soap "${add[@]}"
+  tag FirstTrackNumberEnqueued '[0-9]{1,5}'
+  playqueue "${BASH_REMATCH[1]}"
+  RESTORE=''
+  [[ -z $off ]] || soap "$AVT" SetPlayMode "<NewPlayMode>$mode</NewPlayMode>"
+}
+
 # List favorites, or play favorite n; containers go through the queue - [n]
 favorites() {
-  local add md='' mode off='' uri
+  local md='' uri
 
   if [[ -z $1 ]]; then
     list FV:2
@@ -200,27 +243,7 @@ favorites() {
 
   case $uri in
   x-rincon-cpcontainer:* | x-rincon-playlist:* | file:*)
-    # With shuffle on, the speaker mixes the tracks added into its shuffled order and counts positions in that, so the
-    # one it reports may be another's, even one queued before: shuffle off while they're added and the first starts,
-    # then on again, which shuffles the rest and keeps that one playing. Left off if the speaker refuses on the way
-    soap "$AVT" GetTransportSettings
-    tag PlayMode '[A-Z_]{1,20}'
-    mode=${BASH_REMATCH[1]}
-    # A mode it doesn't know is refused, as repeat does: it may be a shuffle the speaker can't be taken out of
-    case $mode in
-    NORMAL | REPEAT_ONE | REPEAT_ALL) ;;
-    SHUFFLE_NOREPEAT) off=NORMAL ;;
-    SHUFFLE) off=REPEAT_ALL ;;
-    SHUFFLE_REPEAT_ONE) off=REPEAT_ONE ;;
-    *) error 202 ;;
-    esac
-    add=("$AVT" AddURIToQueue
-      "<EnqueuedURI>$uri</EnqueuedURI><EnqueuedURIMetaData>$md</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
-    [[ -z $off ]] || soap "$AVT" SetPlayMode "<NewPlayMode>$off</NewPlayMode>"
-    soap "${add[@]}"
-    tag FirstTrackNumberEnqueued '[0-9]{1,5}'
-    playqueue "${BASH_REMATCH[1]}"
-    [[ -z $off ]] || soap "$AVT" SetPlayMode "<NewPlayMode>$mode</NewPlayMode>"
+    enqueue "$uri" "$md"
     ;;
   *)
     soap "$AVT" SetAVTransportURI "<CurrentURI>$uri</CurrentURI><CurrentURIMetaData>$md</CurrentURIMetaData>"
@@ -349,6 +372,22 @@ member() {
   return 1
 }
 
+# Print the newer API's playbackMetadata for the speaker's group, on port 1400 as UPnP, by the group's id from UPnP:
+# HTTP 200 within the cap, as any reply. For quality, in a subshell, as any failure exits
+metadata() {
+  local g
+
+  soap ZoneGroupTopology GetZoneGroupAttributes
+  [[ $REPLY =~ '<CurrentZoneGroupID>'(RINCON_[[:alnum:]]{1,32}:[0-9]{1,12})'</CurrentZoneGroupID>' ]] || return 1
+  g=${BASH_REMATCH[1]}
+  REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" -w $'\x1e%{http_code}' "-HX-Sonos-Api-Key: $KEY" \
+    "$BASE/api/v1/groups/$g/playbackMetadata") || return 1
+  [[ $REPLY == *$'\x1e'200 ]] || return 1
+  REPLY=${REPLY%$'\x1e'200}
+  fits
+  printf %s "$REPLY"
+}
+
 # Get or set mute; in a group, on every room - [0..1]
 mute() {
   if [[ -z $1 ]]; then
@@ -388,6 +427,10 @@ now() {
   tag TrackURI
   link=${BASH_REMATCH[1]}
   origin src "$link"
+  # None in its details, as for a track from a queue or the library: the speaker's newer API may have it
+  if ((rate == 0)); then
+    quality "$link"
+  fi
 
   # kHz as %g would print it, without its locale switch
   if ((rate)); then
@@ -396,8 +439,12 @@ now() {
     rate=''
   fi
 
-  ((bits)) && bits=" ${bits}-bit" || bits=''
-  q=${fmt:+ $fmt}${loss:+ ${lq[loss]}}$rate$bits
+  # The bit depth for lossless music, or where that isn't said: a lossy stream's is only what its decoder puts out
+  [[ $loss != 0 ]] && ((bits)) && bits=" ${bits}-bit" || bits=''
+  # Its format by name, else whether it's lossless
+  q=${fmt:+ $fmt}
+  [[ -n $q || -z $loss ]] || q=" ${lq[loss]}"
+  q+=$rate$bits
   # A station, Sonos Radio's too, with no title, as some send while starting, or one that's no more than its link's
   # file name, as while it's paused and sends no song, or while the speaker connects (desc): its name from
   # GetMediaInfo instead, one request more then
@@ -478,6 +525,54 @@ pct() {
   printf -v "$1" %s "$out"
 }
 
+# The current item's own track in a playbackMetadata reply, by the reply's nesting, whatever order its parts come in:
+# currentItem.track.id.objectId into quality's o, and its quality's sampleRate, lossless and bitDepth into r, l and b,
+# a string as " and its text. Never another's, as the album's, an artist's, the next item's or the container's.
+# Returns 1 for a reply that isn't whole: one that never closes, or has more than blanks after it - <json>
+playing() {
+  local br='[^{}[\]]' c d=0 end='[]}][[:space:]]*$' k=() p='' re='^[[:space:]]*([^]{}[,[:space:]]+)' s t='' v x=$1
+
+  # Escaped backslashes and quotes set aside, so each " left starts or ends a string, the text between two outside
+  # them. Not [^][{}]: from Bash 5.3, ] isn't taken as itself there
+  x=${x//\\\\/$'\x1c'} x=${x//\\\"/$'\x1d'}
+  while :; do
+    s=${x%%\"*} v=''
+    # After a key its value: a number, true, false or null here, else the next string, an object or an array
+    if [[ $s =~ ^[[:space:]]*: ]]; then
+      p=$t s=${s#*:}
+      [[ ! $s =~ $re ]] || v=${BASH_REMATCH[1]}
+    elif [[ -n $p ]]; then
+      v=\"$t
+    fi
+    if [[ -n $v ]]; then
+      case $d/${k[1]-}/${k[2]-}/${k[3]-}/${k[4]-}/$p in
+      4//currentItem/track/id/objectId) o=$v ;;
+      4//currentItem/track/quality/sampleRate) r=$v ;;
+      4//currentItem/track/quality/lossless) l=$v ;;
+      4//currentItem/track/quality/bitDepth) b=$v ;;
+      esac
+      p=''
+    fi
+    # Each object or array one deeper, under the key before it (none in an array); the reply's own closed: done
+    c=${s//$br/}
+    while [[ -n $c ]]; do
+      case $c in
+      '{'* | '['*) d=$((d + 1)) k[d]=$p p='' ;;
+      *) d=$((d - 1)) ;;
+      esac
+      c=${c#?}
+      ((d > 0)) || break
+    done
+    # Its own object closed at the last bracket here, no string after it and blanks alone; or still open, with more
+    if ((d <= 0)); then
+      ((d == 0)) && [[ -z $c && $x != *\"* && $s =~ $end ]]
+      return
+    fi
+    [[ $x == *\"*\"* ]] || return 1
+    x=${x#*\"} t=${x%%\"*} x=${x#*\"}
+  done
+}
+
 # Get or set repeat (0 off, 1 one, 2 all) or shuffle - <0 repeat | 1 shuffle> [arg]
 playmode() {
   local i modes=(NORMAL REPEAT_ONE REPEAT_ALL SHUFFLE_NOREPEAT SHUFFLE_REPEAT_ONE SHUFFLE) r s
@@ -531,7 +626,8 @@ playqueue() {
 
 # Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in. A service path may
 # name another speaker, as http://<address>:1400/<path>. With SOFT set, on through a refusal, each reply followed by
-# US and its HTTP status, 000 for none - <service path> <action> [arguments] [<service path> <action> <arguments>]...
+# US and its HTTP status, 000 for none; with SLOW set, up to 10 s for each reply, not 2 - <service path> <action>
+# [arguments] [<service path> <action> <arguments>]...
 post() {
   local args=() early=--fail-early u urn w=$'\x1e'
 
@@ -545,12 +641,47 @@ post() {
     ((${#args[@]} == 0)) || args+=(--next)
     args+=("${CURL[@]}" -w "$w" "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
       -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>")
+    [[ -z ${SLOW-} ]] || args+=(-m10)
     (($# > 3)) || break
     shift 3
   done
   # One process, one request after the other; --fail-early stops at the first failure and keeps its status. Sonos
   # refuses an action with HTTP 500, so the ones after it aren't sent; a 200 is checked by the caller, after the run
   LC_ALL=C exec curl -q -s "$early" "${args[@]}"
+}
+
+# A track from a queue or the music library whose details have no rate, as Spotify's, another service's (Qobuz) or a
+# file's: the speaker's newer API has its quality (metadata), used only for the track its reply names as playing, by
+# the id its link carries, unescaped: spotify:track:<id>, track:<id>:5 (a link's file extension left off), S://<path>
+# for a file. Nothing when it doesn't answer, refuses, or tells of another, as around a skip. Sets now's bits, rate
+# and loss - <TrackURI>
+quality() {
+  local b='' hit=0 id ids=() j l='' o='' r='' x
+
+  case $1 in
+  x-sonos-spotify:* | x-sonos-http:*) id=${1#*:} ;;
+  x-file-cifs:*) id=S:${1#x-file-cifs:} ;;
+  *) return 0 ;;
+  esac
+  id=${id%%\?*}
+  id=${id//&amp;/\&} # Unquoted: quoted, Bash 3.2 keeps the \; bare, from Bash 5.2 & stands for the match
+  unpct id "$id"
+  [[ ${#id} -le 512 && $id != *[[:cntrl:]]* ]] || return 0
+  ids=("$id")
+  # A service's link may end in a file extension its id hasn't got: track%3a6112208%3a5.mp3 for track:6112208:5
+  [[ $1 != x-sonos-http:* || ! $id =~ \.[[:alnum:]]{2,5}$ ]] || ids+=("${id%.*}")
+  # In a subshell: a failure there, or a reply that's no answer, is no quality, never the end of now
+  j=$(metadata 2>/dev/null) || return 0
+  playing "$j" || return 0
+  # Its id unescaped as JSON, each / as \/ as the speakers write it, then as the link
+  [[ $o == \"* ]] || return 0
+  o=${o#\"} o=${o//'\/'//} o=${o//$'\x1c'/\\} o=${o//$'\x1d'/\"}
+  unpct o "$o"
+  for x in "${ids[@]}"; do [[ $o != "$x" ]] || hit=1; done
+  ((hit)) && [[ $r =~ ^[1-9][0-9]{3,5}$ && $l =~ ^(true|false)$ ]] || return 0
+  [[ $l == true ]] && loss=1 || loss=0
+  rate=$r
+  [[ ! $b =~ ^[1-9][0-9]?$ ]] || bits=$b
 }
 
 # List the queue, marking the current track, or play from track n - [n]
@@ -783,6 +914,39 @@ speech() {
   fi
 }
 
+# Play a Spotify track, album or playlist from its link, through the queue as favorites does a playlist: an album or
+# playlist in one request, Sonos reading its tracks from Spotify. The speakers play it with the household's own
+# Spotify account: Spotify is service 9 on every speaker, and account 1 stands in for the household's, which Sonos
+# puts in its place - <open.spotify.com link | spotify: URI>
+spotify() {
+  local cls id item kind md par='' re res='' uri
+
+  re='^(https?://open\.spotify\.com/(intl-[[:alpha:]-]{2,8}/)?(track|album|playlist)/|spotify:(track|album|playlist):)'
+  re+='([0-9A-Za-z]{22})([?#].*)?$'
+  [[ $1 =~ $re ]] || error 201
+  kind=${BASH_REMATCH[3]}${BASH_REMATCH[4]} id=spotify%3a${BASH_REMATCH[3]}${BASH_REMATCH[4]}%3a${BASH_REMATCH[5]}
+  # As the Sonos app queues them: a track by its own link, with its id behind 10032020; an album or playlist whole, by
+  # its id behind 1004206c or 1006206c. Escaped once, as SOAP carries them
+  case $kind in
+  track)
+    uri="x-sonos-spotify:$id?sid=9&amp;flags=8232&amp;sn=1"
+    item=10032020$id par=-1 cls=object.item.audioItem.musicTrack
+    res="&lt;res protocolInfo=&quot;sonos.com-spotify:*:audio/x-spotify:*&quot;&gt;x-sonos-spotify:$id?sid=9&amp;amp;"
+    res+="flags=8232&amp;amp;sn=1&lt;/res&gt;"
+    ;;
+  album) item=1004206c$id cls=object.container.album.musicAlbum ;;
+  *) item=1006206c$id cls=object.container.playlistContainer ;;
+  esac
+  [[ $kind == track ]] || uri="x-rincon-cpcontainer:$item?sid=9&amp;flags=8300&amp;sn=1"
+  md="&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot; xmlns:upnp=&quot;urn:schemas-upnp-org:"
+  md+="metadata-1-0/upnp/&quot; xmlns:r=&quot;urn:schemas-rinconnetworks-com:metadata-1-0/&quot; xmlns=&quot;urn:"
+  md+="schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot;&gt;&lt;item id=&quot;$item&quot; parentID=&quot;$par&quot; "
+  md+="restricted=&quot;true&quot;&gt;&lt;dc:title&gt;&lt;/dc:title&gt;&lt;upnp:class&gt;$cls&lt;/upnp:class&gt;$res"
+  md+="&lt;desc id=&quot;cdudn&quot; nameSpace=&quot;urn:schemas-rinconnetworks-com:metadata-1-0/&quot;&gt;"
+  md+="SA_RINCON2311_X_#Svc2311-0-Token&lt;/desc&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"
+  enqueue "$uri" "$md"
+}
+
 # Match REPLY element; sets BASH_REMATCH[1] or exits - <element> [value pattern]
 tag() {
   [[ $REPLY =~ "<$1>"(${2-[^<]*})"</$1>" ]] || error 202
@@ -855,10 +1019,17 @@ tv() {
     "<CurrentURI>x-sonos-htastream:$id:spdif</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
 }
 
+# Percent-decode text, as a link escapes it: each %XX a byte, anything else as it is - <var> <text>
+unpct() {
+  local s=${2//\\/\\\\} # A backslash stays one
+
+  printf -v "$1" %b "${s//%/\\x}"
+}
+
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 4.2 - Control Sonos over UPnP
+  printf '%s\n' "$nm 5.0 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -869,7 +1040,7 @@ Playback:
   artwork | now | sleep 0..120
 
 Sources:
-  favorites 1..n | file //host/share/path | tv
+  favorites 1..n | file //host/share/path | spotify link | tv
   clear | queue 1..n | rescan
 
 Sound:
@@ -888,9 +1059,11 @@ Hardware:
 Omit the argument to read the current value.
 Volume and seek accept a relative value (e.g. vol +5, seek -30).
 Seek also accepts a min:sec or h:mm:ss position or offset
-(e.g. 3:39, 1:15:00, -1:30).
+  (e.g. 3:39, 1:15:00, -1:30).
+Spotify plays an open.spotify.com or spotify: link to a track,
+  album or playlist through the queue.
 In a group, playback and the queue go to its leader; vol and mute
-set every room to the same level.
+  set every room to the same level.
 Requires SONOS_IP: the speaker's IP address or .local name."
 }
 
@@ -936,7 +1109,7 @@ esac
 # Playback and the queue on the group's leader; sound, hardware and the TV on the speaker itself, and now asks the
 # leader only once it knows there is one
 case $opt in
-artwork | clear | file | next | pause | play | playqueue | prev | previous | queue | repeat | seek | shuffle | sleep | stop)
+artwork | clear | file | next | pause | play | playqueue | prev | previous | queue | repeat | seek | shuffle | sleep | spotify | stop)
   LEADER=1
   ;;
 favorites | favourites | favs)
@@ -983,6 +1156,9 @@ favorites | favourites | favs)
   ;;
 file)
   file "$arg"
+  ;;
+spotify)
+  spotify "$arg"
   ;;
 tv)
   tv

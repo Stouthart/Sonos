@@ -1,8 +1,17 @@
-<!-- 4.2 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 5.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 4.2 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 5.0 is the version distributed; the entries below it show how the scripts got there.
+
+## 5.0 - November 2026
+
+Spotify links played through the queue, and in `now` the quality of a track from a queue or the music library.
+
+- **Spotify links:** `spotify <link>` plays a Spotify track, album or playlist from its `open.spotify.com` link or its `spotify:` address: added to the end of the queue and played from its first track, as `favorites` plays a playlist, also with shuffle on. An album or playlist goes in with one request, and the speaker reads its tracks from Spotify. The speakers play it with the household's own Spotify account, added in the Sonos app, so there's no Spotify sign-in here.
+- **A track's quality from a queue or the library:** `now` shows the quality of a track whose UPnP details carry no rate, a Spotify track or another service's (Qobuz) from the queue, or a file from a share, such as `lossless 44.1 kHz 16-bit [spotify]` or `mpeg 44.1 kHz [file]`, where it showed none or the format alone. It comes from the speaker's newer interface, which port `1400` also serves over plain HTTP, and only when the speaker names that same track as the one playing: two requests more, about 40 ms, only for such a track. A track played on its own, as a Spotify favorite starts it, has none there either, and neither has a station. The bit depth shows for lossless music only, everywhere, as a lossy stream's is only what its decoder puts out.
+- **Shuffle back on after a failure:** `favorites n` on a playlist, and `spotify`, switch shuffle off while the tracks go in, and now switch it on again also when adding or starting them fails, where it stayed off; the error stands.
+- **Time to add an album or playlist:** `soc-curl.sh` waits up to 10 seconds for the speaker to add one, a favorite's too, where it gave up after 2 and exited `28` while the speaker read a long one from its service.
 
 ## 4.2 - November 2026
 
