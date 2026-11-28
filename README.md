@@ -1,4 +1,4 @@
-<!-- 5.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 5.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Control Sonos over UPnP
 
@@ -13,7 +13,7 @@ Two interchangeable versions are included:
 
 Both take the same options and print the same output.
 
-This is **version 5.0**. The [release notes](RELEASE.md) list what each version changed.
+This is **version 5.1**. The [release notes](RELEASE.md) list what each version changed.
 
 ## Requirements
 
@@ -77,6 +77,8 @@ Options that only act (`play`, `vol 40`) print nothing; the exit code tells you 
 | `now`            | Show formatted now playing info                           |
 | `sleep [0..120]` | Show the sleep timer, set it in minutes, or cancel it (0) |
 
+`pause` stops a stream that stops rather than pauses: the speaker refuses Pause there and names Stop among the actions it takes, so `pause` sends Stop, as the Sonos app's button does, and the next `pause` plays it again. That is two requests more, only after the refusal. A source that takes neither, as the TV, reads `Pause not available for the current source.` Only a refusal that came whole counts as one. Tested with a radio station on a Beam Ultra.
+
 `repeat` and `shuffle` set one combined play mode, so each first reads the current mode; a value that is already set sends nothing.
 
 A bare `seek` prints the position in whole seconds. To move, pass seconds, a `min:sec` or an `h:mm:ss` position (`seek 219` and `seek 3:39` are the same jump, `seek 1:15:00` goes past the first hour), each with an optional `+` or `-`. Seconds top out at `3599` and `min:sec` at `59:59`; minutes and seconds are always two digits after a colon. A relative seek is a single request: the speaker stops at the start of the track, and past the end it moves on to the next one. A source that can't seek makes the speaker refuse it (exit `203`).
@@ -89,7 +91,7 @@ A track from a queue or the music library has no rate over UPnP: a Spotify track
 
 On the TV input, which has no title, position or duration, quality is the format the TV sends, such as `Dolby Atmos (MAT)`, `Dolby Digital 5.1`, `PCM 2.0` or `No input`. For Dolby Atmos, the brackets say how it arrives: `DD+` as streaming apps send it, `TrueHD` from a disc, `MAT` from a player that decodes it first, such as an Apple TV. A format code the speaker reports that soc doesn't know shows as `format <code>`.
 
-`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value.
+`sleep` is the app's **Sleep timer**. A bare `sleep` prints the time left as `HH:MM:SS`, or nothing when no timer is set. It takes whole minutes, and no relative value. In a group the timer is the group's: it goes to the leader and stops every room.
 
 ### Sources
 
@@ -265,7 +267,7 @@ alias np='soc.sh now'
 | `204`                                                  | `SONOS_IP` is not set                                                  |
 | `205`                                                  | The favorite is a shortcut, with nothing to play over UPnP             |
 
-A refused action names the action and the UPnP error code, as in `Sonos refused SetEQ, UPnP error 402.` Error 701 means the current source can't do it, and reads `<Action> not available for the current source.` instead. `soc-curl.sh` exits with any other curl error code, as `Unexpected curl error N.`
+A refused action names the action and the UPnP error code, as in `Sonos refused Play, UPnP error 402.` Error 701 means the current source can't do it, and reads `<Action> not available for the current source.` instead. A sound setting the speaker hasn't got, as Night Sound on an Era 300, reads `night not available on this speaker.`, by its option. `soc-curl.sh` exits with any other curl error code, as `Unexpected curl error N.`
 
 `soc.sh` has no timeout. A reachable address that refuses the connection fails at once, but an address where nothing answers blocks until the operating system gives up, about 75 seconds on macOS. Use `soc-curl.sh` if that matters.
 
@@ -282,11 +284,11 @@ Pass `--xdbg` as the very first argument to trace execution with per-line timing
 - The UPnP actions are Sonos's own and unofficial. They may change with a software update.
 - Requests are plain HTTP on the local network, without authentication. Anything on the same network can control the speaker.
 - Text from the speaker is stripped of control characters, C1 controls included, before it is printed, so it pastes cleanly into a terminal or a pipe.
-- Replies are read as HTTP has them: `soc.sh` takes chunked replies whatever the header's case or place, refuses one whose chunks aren't framed right, that has no blank line after its headers, whose `Content-Length` isn't a number alone or whose body isn't as long as it says, and reads the reply's verdict from its body alone. Both scripts refuse a reply over 16 MiB, counted in bytes, on any Bash and curl, send a write only once the speaker answered the one before it as done, and find group members by their attributes, in any order.
+- Replies are read as HTTP has them: `soc.sh` takes chunked replies whatever the header's case or place, refuses one whose chunks aren't framed right, that has no blank line after its headers, whose `Content-Length` isn't a number alone or whose body isn't as long as it says, and reads the reply's verdict from its body alone. Both scripts take a reply as the speaker's answer only with HTTP 200 and the action's response opening the body of a SOAP envelope, whole, as a Sonos writes it, and as its refusal only with HTTP 500 and a SOAP fault there: a page that merely names the response is neither, nor a redirect, nor a transfer cut short, nor an envelope that never closes. Both scripts refuse a reply over 16 MiB, counted in bytes, on any Bash and curl, send a write only once the speaker answered the one before it as done, and find group members by their attributes, in any order.
 
 ### Groups
 
-In a group, playback and the queue go to the group's leader, whichever speaker `SONOS_IP` names. A member refuses Pause, accepts Play and ignores it, and reports neither the group's track nor its queue, so before its first request a playback or queue option asks the speaker whether it leads: one small request more, about 20 ms. `now` asks only once the speaker turns out to be a member. The leader, and the rooms `vol` and `mute` set below, must be on the local network, at a private, link-local or loopback IPv4 address: an address elsewhere is never asked, and the script exits `202`.
+In a group, playback, the queue and the sleep timer go to the group's leader, whichever speaker `SONOS_IP` names, so a timer set from any room stops them all. A member refuses Pause, accepts Play and ignores it, and reports neither the group's track nor its queue, so before its first request a playback or queue option asks the speaker whether it leads: one small request more, about 20 ms. `now` asks only once the speaker turns out to be a member. The leader, and the rooms `vol` and `mute` set below, must be on the local network, at a private, link-local or loopback IPv4 address: an address elsewhere is never asked, and the script exits `202`.
 
 `vol` and `mute` set every room of the group to the same level, unlike the Sonos app, which keeps the rooms' shares. A relative `vol` steps the speaker `SONOS_IP` names, and the other rooms take its new level, so `vol +0` brings a group back to one level. Read, they print the speaker's own. A bonded Sub or surrounds aren't rooms: they follow their main speaker. The group's rooms are asked with the change itself, alongside it in `soc.sh` and in the same curl in `soc-curl.sh`, so a speaker alone takes about as long as before. Other sound and hardware settings, and `tv`, stay with the speaker itself.
 

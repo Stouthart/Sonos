@@ -1,8 +1,18 @@
-<!-- 5.0 - Copyright (C) 2026 Stouthart. All rights reserved. -->
+<!-- 5.1 - Copyright (C) 2026 Stouthart. All rights reserved. -->
 
 # Release notes
 
-Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 5.0 is the version distributed; the entries below it show how the scripts got there.
+Highlights per version, newest first, with 1.x, 2.x and 3.x condensed per major version. 5.1 is the version distributed; the entries below it show how the scripts got there.
+
+## 5.1 - November 2026
+
+Clearer answers where a speaker can't do what's asked, and `pause` on a stream that only stops.
+
+- **`pause` on a stream that stops rather than pauses:** where the speaker refuses Pause and names Stop among the actions it takes, `pause` stops the stream, as the Sonos app's button does, and the next `pause` plays it again; it exited `203` there. Two requests more, only after the refusal. A source that takes neither, as the TV, reads `Pause not available for the current source.` as before. Tested with a radio station on a Beam Ultra.
+- **The sleep timer in a group:** the usage text and the README now say what `sleep` already did: the timer goes to the group's leader, so it stops every room.
+- **A setting the speaker hasn't got:** a sound setting on a speaker without it, as `night` on an Era 300, reads `night not available on this speaker.`, where it read `Sonos refused GetEQ, UPnP error 402.` The exit code stays `203`.
+- **Replies read more strictly:** a reply counts as the speaker's answer only with HTTP 200 and the action's response opening the body of a SOAP envelope, as a Sonos writes it, and as its refusal only with HTTP 500 and a SOAP fault there. A page that merely names the response, a redirect that carries one, an envelope that never closes, or in `soc-curl.sh` a refusal whose transfer was cut short no longer passes, so no write follows one; they exit `202`, or with curl's own code. It costs nothing measurable on a command, and under 0.2 ms on a 1,000-track queue.
+- **Hardening:** `soc-curl.sh` ignores a `SOFT` or `SLOW` variable in the environment, which reached its requests, and in `soc.sh` only a single digit can reach the `eval` that opens `settings`' extra connections.
 
 ## 5.0 - November 2026
 

@@ -49,7 +49,16 @@ error() {
   200) msg='Missing or invalid option.' ;;
   201) msg='Missing or invalid argument.' ;;
   202) msg='Invalid response from Sonos.' ;;
-  203) [[ $3 == 701 ]] && msg="$2 not available for the current source." || msg="Sonos refused $2, UPnP error $3." ;;
+  203)
+    # 402 for a sound setting: one this speaker hasn't got, as Night Sound on an Era 300; said by its option
+    if [[ $3 == 701 ]]; then
+      msg="$2 not available for the current source."
+    elif [[ $3 == 402 && $2 == [GS]etEQ ]]; then
+      msg="$opt not available on this speaker."
+    else
+      msg="Sonos refused $2, UPnP error $3."
+    fi
+    ;;
   204) msg="Set SONOS_IP to the speaker's IPv4 address." ;;
   205) msg="Favorite $2 is a shortcut; play it from the Sonos app." ;;
   esac
@@ -418,8 +427,7 @@ member() {
 # Print the newer API's playbackMetadata for the speaker's group, on port 1400 as UPnP, by the group's id from UPnP.
 # For quality, in a subshell, as any failure exits; 2 s for each reply, as it's an extra
 metadata() {
-  local g rc=0 rd=("${RD[@]}")
-  local RD=(-t 2 "${rd[@]}")
+  local g rc=0 RD=(-t 2 "${RD[@]}") # its own, from the script's: expanded before this one exists
 
   soap ZoneGroupTopology GetZoneGroupAttributes
   [[ $REPLY =~ '<CurrentZoneGroupID>'(RINCON_[[:alnum:]]{1,32}:[0-9]{1,12})'</CurrentZoneGroupID>' ]] || return 1
@@ -657,7 +665,18 @@ playpause() {
   soap "$AVT" GetTransportInfo
   tag CurrentTransportState '[A-Z_]{1,32}'
   case ${BASH_REMATCH[1]} in
-  PLAYING | TRANSITIONING) soap "$AVT" Pause ;;
+  PLAYING | TRANSITIONING)
+    # A stream that stops rather than pauses refuses Pause (UPnP error 701) and names Stop among the actions it
+    # takes: stopped then, as the app's button does. Two requests more, only after that refusal; one that takes
+    # neither, as the TV, keeps Pause's refusal. Only a refusal that came whole counts as one (recv)
+    send 3 "$AVT" Pause
+    recv 3 Pause soft && return
+    [[ ${BASH_REMATCH[1]} == 701 ]] || error 203 Pause "${BASH_REMATCH[1]}"
+    soap "$AVT" GetCurrentTransportActions
+    tag Actions
+    [[ ${BASH_REMATCH[1]} =~ (^|,)[[:space:]]*Stop[[:space:]]*(,|$) ]] || error 203 Pause 701
+    soap "$AVT" Stop
+    ;;
   *) soap "$AVT" Play '<Speed>1</Speed>' ;;
   esac
 }
@@ -737,25 +756,32 @@ queue() {
   list Q:0 "$cur" "$uri"
 }
 
-# Read an fd to EOF into REPLY; exits on fault or foreign reply, or with [soft] set returns 1 on a fault, its errorCode
-# in BASH_REMATCH[1] - <fd> <action> [soft]
+# Read an fd (3 to 9) to EOF into REPLY. Done is HTTP 200 and a SOAP envelope, whole, whose Body opens with the
+# action's response, as a Sonos writes it; a refusal is HTTP 500 and a SOAP fault there. A page that merely names the
+# response isn't the speaker's answer, nor a body as long as its headers say that never closes its envelope. Exits
+# on fault or foreign reply, or with [soft] set returns 1 on a fault, its errorCode in BASH_REMATCH[1] - <fd>
+# <action> [soft]
 recv() {
-  local ok=0 rc=0
+  local rc=0 status=0
 
   IFS= read -r "${RD[@]}" REPLY <&"$1" || rc=$?
   case $1 in
   3) exec 3<&- ;;
   4) exec 4<&- ;;
-  *) eval "exec $1<&-" ;;
+  [5-9]) eval "exec $1<&-" ;; # settings' alone; a digit only reaches eval
   esac
 
-  # As in get, then the body alone, so a header can't pass for the reply or its fault.
-  # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
+  # As in get, then the body alone, so a header can't pass for the reply or its fault
   ((rc == 1 && ${#REPLY} < MAX)) || error 202
-  [[ $REPLY != 'HTTP/1.1 200 '* ]] || ok=1
+  case $REPLY in
+  'HTTP/1.1 200 '*) status=200 ;;
+  'HTTP/1.1 500 '*) status=500 ;;
+  esac
   dechunk
-  ((ok)) && [[ $REPLY == *:"$2"Response[[:space:]/\>]* || $REPLY == *\<"$2"Response[[:space:]/\>]* ]] && return
-  if [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
+  [[ ${REPLY: -22} == '</s:Body></s:Envelope>' ]] || error 202
+  ((status != 200)) || [[ $REPLY != '<s:Envelope '*'><s:Body><u:'"$2"Response[[:space:]/\>]* ]] || return 0
+  if ((status == 500)) && [[ $REPLY == '<s:Envelope '*'><s:Body><s:Fault>'* ]] &&
+    [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
     [[ -z ${3-} ]] || return 1
     error 203 "$2" "${BASH_REMATCH[1]}"
   fi
@@ -843,7 +869,7 @@ send() {
   case $1 in
   3) { exec 3<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
   4) { exec 4<>"/dev/tcp/$HOST/1400"; } 2>/dev/null ;;
-  *) { eval "exec $1<>\"/dev/tcp/\$HOST/1400\""; } 2>/dev/null ;;
+  [5-9]) { eval "exec $1<>\"/dev/tcp/\$HOST/1400\""; } 2>/dev/null ;;
   esac || error 7
   printf 'POST /%s/Control HTTP/1.1\r\nHost: %s:1400\r\nConnection: close\r\nContent-Type: text/xml; charset="utf-8"\r\nSOAPACTION: "%s#%s"\r\nContent-Length: %d\r\n\r\n%s' \
     "$2" "$HOST" "$urn" "$3" "$n" "$body" >&"$1"
@@ -1069,7 +1095,7 @@ unpct() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 5.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 5.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -1102,8 +1128,9 @@ Seek also accepts a min:sec or h:mm:ss position or offset
   (e.g. 3:39, 1:15:00, -1:30).
 Spotify plays an open.spotify.com or spotify: link to a track,
   album or playlist through the queue.
-In a group, playback and the queue go to its leader; vol and mute
-  set every room to the same level.
+In a group, playback, the queue and the sleep timer go to its
+  leader, so a timer stops every room; vol and mute set every
+  room to the same level.
 Requires SONOS_IP: the speaker's IPv4 address."
 }
 

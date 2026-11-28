@@ -12,6 +12,8 @@ LEADER=0
 MEDIA=''
 # The play mode to put back should the script end on its way: shuffle is off while tracks go in (enqueue)
 RESTORE=''
+# post's two switches, its callers' alone: one of that name in the environment changes nothing
+SOFT='' SLOW=''
 # Bash before 4.1 splits long lists slowly, so reads pages
 PG=100
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401)) || PG=0
@@ -20,7 +22,7 @@ PG=100
 MAX=16777216
 # A 2-byte character: its length shows whether Bash counts bytes (C locale) or characters (UTF-8; Android always)
 MB=$'\xc3\xa9'
-CURL=(-g --noproxy '*' -4 -m2 --max-filesize "$MAX" -HUser-Agent: --fail-with-body
+CURL=(-g --noproxy '*' -4 -m2 --max-filesize "$MAX" -HUser-Agent:
   '-HContent-Type: text/xml; charset="utf-8"')
 
 # Service paths; Master channel argument
@@ -47,7 +49,16 @@ error() {
   200) msg='Missing or invalid option.' ;;
   201) msg='Missing or invalid argument.' ;;
   202 | 63) msg='Invalid response from Sonos.' ;; # 63: over the reply cap
-  203) [[ $3 == 701 ]] && msg="$2 not available for the current source." || msg="Sonos refused $2, UPnP error $3." ;;
+  203)
+    # 402 for a sound setting: one this speaker hasn't got, as Night Sound on an Era 300; said by its option
+    if [[ $3 == 701 ]]; then
+      msg="$2 not available for the current source."
+    elif [[ $3 == 402 && $2 == [GS]etEQ ]]; then
+      msg="$opt not available on this speaker."
+    else
+      msg="Sonos refused $2, UPnP error $3."
+    fi
+    ;;
   204) msg="Set SONOS_IP to the speaker's IP address or .local name." ;;
   205) msg="Favorite $2 is a shortcut; play it from the Sonos app." ;;
   *) msg="Unexpected curl error $1." ;;
@@ -292,7 +303,7 @@ fits() {
 # GET a page into REPLY - <path>
 get() {
   [[ -n ${SONOS_IP-} ]] || error 204
-  REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" "$BASE/$1") || error $? "$1"
+  REPLY=$(LC_ALL=C curl -q -s --fail-with-body "${CURL[@]}" "$BASE/$1") || error $? "$1"
   fits
 }
 
@@ -380,7 +391,7 @@ metadata() {
   soap ZoneGroupTopology GetZoneGroupAttributes
   [[ $REPLY =~ '<CurrentZoneGroupID>'(RINCON_[[:alnum:]]{1,32}:[0-9]{1,12})'</CurrentZoneGroupID>' ]] || return 1
   g=${BASH_REMATCH[1]}
-  REPLY=$(LC_ALL=C curl -q -s "${CURL[@]}" -w $'\x1e%{http_code}' "-HX-Sonos-Api-Key: $KEY" \
+  REPLY=$(LC_ALL=C curl -q -s --fail-with-body "${CURL[@]}" -w $'\x1e%{http_code}' "-HX-Sonos-Api-Key: $KEY" \
     "$BASE/api/v1/groups/$g/playbackMetadata") || return 1
   [[ $REPLY == *$'\x1e'200 ]] || return 1
   REPLY=${REPLY%$'\x1e'200}
@@ -601,10 +612,24 @@ playmode() {
 }
 
 playpause() {
+  local rc=0 t
+
   soap "$AVT" GetTransportInfo
   tag CurrentTransportState '[A-Z_]{1,32}'
   case ${BASH_REMATCH[1]} in
-  PLAYING | TRANSITIONING) soap "$AVT" Pause ;;
+  PLAYING | TRANSITIONING)
+    # A stream that stops rather than pauses refuses Pause (UPnP error 701) and names Stop among the actions it
+    # takes: stopped then, as the app's button does. Two requests more, only after that refusal; one that takes
+    # neither, as the TV, keeps Pause's refusal. Only a refusal that came whole counts as one (reply)
+    REPLY=$(post "$AVT" Pause) || rc=$?
+    t=${REPLY: -27} REPLY=${REPLY%$'\x1f'???$'\x1e'}
+    reply Pause "${t:23:3}" "$rc" "${t:0:22}" soft && return
+    [[ ${BASH_REMATCH[1]} == 701 ]] || error 203 Pause "${BASH_REMATCH[1]}"
+    soap "$AVT" GetCurrentTransportActions
+    tag Actions
+    [[ ${BASH_REMATCH[1]} =~ (^|,)[[:space:]]*Stop[[:space:]]*(,|$) ]] || error 203 Pause 701
+    soap "$AVT" Stop
+    ;;
   *) soap "$AVT" Play '<Speed>1</Speed>' ;;
   esac
 }
@@ -625,23 +650,26 @@ playqueue() {
 }
 
 # Print the replies to UPnP actions, one after the other; curl replaces the subshell it runs in. A service path may
-# name another speaker, as http://<address>:1400/<path>. With SOFT set, on through a refusal, each reply followed by
-# US and its HTTP status, 000 for none; with SLOW set, up to 10 s for each reply, not 2 - <service path> <action>
-# [arguments] [<service path> <action> <arguments>]...
+# name another speaker, as http://<address>:1400/<path>. Each reply is followed by US, its HTTP status (000 for none)
+# and RS. With SOFT set, on through a refusal, the status followed by a colon and curl's own for that transfer; with
+# SLOW set, up to 10 s for each reply, not 2 - <service path> <action> [arguments] [<service path> <action>
+# <arguments>]...
 post() {
-  local args=() early=--fail-early u urn w=$'\x1e'
+  local args=() early=--fail-early fail=--fail-with-body u urn w=$'\x1f%{http_code}\x1e'
 
   # SOFT: on through a failure, each reply with its HTTP status and curl's own for that transfer (curl 7.75)
-  [[ -z ${SOFT-} ]] || early=--no-fail-early w=$'\x1f%{http_code}:%{exitcode}\x1e'
-
+  [[ -z $SOFT ]] || early=--no-fail-early w=$'\x1f%{http_code}:%{exitcode}\x1e'
+  # A run of several stops at the first refusal: curl takes HTTP 500 as a failure there, 22, whatever became of
+  # the transfer. One request alone, or SOFT's, keeps curl's own status, so one cut short shows as that
+  (($# > 3)) && [[ -z $SOFT ]] || fail=--no-fail-with-body
   while :; do
     urn=urn:schemas-upnp-org:service:${1##*/}:1
     u=$1
     [[ $u == http://* ]] || u=$BASE/$1
     ((${#args[@]} == 0)) || args+=(--next)
-    args+=("${CURL[@]}" -w "$w" "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
+    args+=("${CURL[@]}" "$fail" -w "$w" "-HSOAPACTION: \"$urn#$2\"" "$u/Control"
       -d "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$2 xmlns:u=\"$urn\"><InstanceID>0</InstanceID>${3-}</u:$2></s:Body></s:Envelope>")
-    [[ -z ${SLOW-} ]] || args+=(-m10)
+    [[ -z $SLOW ]] || args+=(-m10)
     (($# > 3)) || break
     shift 3
   done
@@ -703,13 +731,25 @@ queue() {
   list Q:0 "$cur" "$uri"
 }
 
-# Check REPLY to an action; exits on fault, curl error or foreign reply - <action> [curl status]
+# Judge REPLY, the reply to an action, by its HTTP status, by curl's status for that transfer, and by its own last 22
+# bytes, which the caller cut with the HTTP status, so a long list is read once for both. Done is HTTP 200 and a
+# SOAP envelope, whole, whose Body opens with the action's response, as a Sonos writes it: a page that merely names
+# the response isn't the speaker's answer, nor a redirect that carries one. A refusal is HTTP 500 with a SOAP fault
+# as whole. Exits on a fault, a curl error or a foreign reply, or with [soft] set returns 1 on a fault, its errorCode
+# in BASH_REMATCH[1] - <action> <HTTP status> <curl status> <end> [soft]
 reply() {
   fits
-  # Globs start with a literal after *, so the match skips ahead instead of trying a bracket at every byte
-  ((${2-0} == 0)) && [[ $REPLY == *:"$1"Response[[:space:]/\>]* || $REPLY == *\<"$1"Response[[:space:]/\>]* ]] && return
-  [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]] && error 203 "$1" "${BASH_REMATCH[1]}"
-  ((${2-0} == 0)) || error "$2" "$1"
+  # A transfer cut short or timed out is no answer, whatever it holds. 22: HTTP 500 where curl was to fail on it
+  (($3 == 0 || $3 == 22)) || error "$3" "$1"
+  if [[ $4 == '</s:Body></s:Envelope>' ]]; then
+    [[ $2 != 200 || $REPLY != '<s:Envelope '*'><s:Body><u:'"$1"Response[[:space:]/\>]* ]] || return 0
+    if [[ $2 == 500 && $REPLY == '<s:Envelope '*'><s:Body><s:Fault>'* ]] &&
+      [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
+      [[ -z ${5-} ]] || return 1
+      error 203 "$1" "${BASH_REMATCH[1]}"
+    fi
+  fi
+  [[ $2 != [45][0-9][0-9] ]] || error 22 "$1"
   error 202
 }
 
@@ -779,23 +819,25 @@ seek() {
 # REPLIES to the others, exits on fault, curl error or foreign reply - <service path> <action> [arguments]
 # [<service path> <action> <arguments>]...
 soap() {
-  local r rc=0
+  local r rc=0 t
 
   # Here, so option and argument errors come first
   [[ -n ${SONOS_IP-} ]] || error 204
   ((LEADER != 1)) || leader
   r=$(post "$@") || rc=$?
   REPLIES=()
-  # curl ends each reply with RS and stops at the first failure, so replies followed by another got through
+  # curl ends each reply with US, its HTTP status and RS, and stops at the first failure, so replies followed by
+  # another got through. t: the reply's last 22 bytes and that status, taken in one
   while (($# > 3)) && [[ $r == *$'\x1e'?* ]]; do
     REPLY=${r%%$'\x1e'*}
     r=${r:${#REPLY}+1}
-    reply "$2"
+    t=${REPLY: -26} REPLY=${REPLY%$'\x1f'???}
+    reply "$2" "${t:23}" 0 "${t:0:22}"
     REPLIES+=("$REPLY")
     shift 3
   done
-  REPLY=${r%$'\x1e'}
-  reply "$2" "$rc"
+  t=${r: -27} REPLY=${r%$'\x1f'???$'\x1e'}
+  reply "$2" "${t:23:3}" "$rc" "${t:0:22}"
 }
 
 # Print the settings as option=value in the Sonos app's order: Sound (vol and mute aside), Sub audio, Home theater and
@@ -845,7 +887,7 @@ settings() {
     # A transfer that failed by itself, as one cut short, holds no setting; a refusal comes as HTTP 500, curl's 22
     ((rc == 0 || rc == 22)) || error "$rc" "${r[i + 2]}"
     if [[ $code == 200 ]]; then
-      reply "${r[i + 2]}" # This action's own reply, not another's
+      reply "${r[i + 2]}" "$code" "$rc" "${REPLY: -22}" # This action's own reply, not another's
       # The reply's first value; RoomCalibrationEnabled comes before Available. The speaker's address, and the
       # topology whole
       case ${r[i + 2]} in
@@ -858,11 +900,14 @@ settings() {
       esac
       [[ $REPLY =~ $p ]] || error 202
       v+=("${BASH_REMATCH[1]}")
-    elif [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
+    elif [[ $code == 500 && $REPLY == '<s:Envelope '*'><s:Body><s:Fault>'*'</s:Body></s:Envelope>' ]] &&
+      [[ $REPLY =~ '<errorCode>'([0-9]{1,4})'</errorCode>' ]]; then
       [[ -n $fault ]] || fault="${r[i + 2]} ${BASH_REMATCH[1]}"
       v+=('')
-    else
+    elif [[ $code == [45][0-9][0-9] ]]; then
       error 22 "${r[i + 2]}"
+    else
+      error 202
     fi
   done
 
@@ -1029,7 +1074,7 @@ unpct() {
 usage() {
   local nm=${0##*/}
 
-  printf '%s\n' "$nm 5.0 - Control Sonos over UPnP
+  printf '%s\n' "$nm 5.1 - Control Sonos over UPnP
 Copyright (C) 2026 Stouthart. All rights reserved.
 
 Usage: $nm <option> [argument]
@@ -1062,8 +1107,9 @@ Seek also accepts a min:sec or h:mm:ss position or offset
   (e.g. 3:39, 1:15:00, -1:30).
 Spotify plays an open.spotify.com or spotify: link to a track,
   album or playlist through the queue.
-In a group, playback and the queue go to its leader; vol and mute
-  set every room to the same level.
+In a group, playback, the queue and the sleep timer go to its
+  leader, so a timer stops every room; vol and mute set every
+  room to the same level.
 Requires SONOS_IP: the speaker's IP address or .local name."
 }
 
